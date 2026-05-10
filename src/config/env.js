@@ -32,6 +32,9 @@ export const env = {
   uploadFilesDir: req('UPLOAD_FILES_DIR', ''),
   /** Optional origin for absolute download URLs in export_jobs.file_url, e.g. http://localhost:4000 */
   publicBaseUrl: req('PUBLIC_BASE_URL', ''),
+  mediaStorageProvider: req('MEDIA_STORAGE_PROVIDER', 'local'),
+  emailFrom: req('EMAIL_FROM', 'no-reply@lunarsecurity.local'),
+  smtpUrl: req('SMTP_URL', ''),
   corsOrigins: (req('CORS_ORIGINS', '') || '')
     .split(',')
     .map((s) => s.trim())

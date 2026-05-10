@@ -38,6 +38,48 @@ export function computeUkDeductions(grossPence, periodDays) {
   };
 }
 
+export function computePayrollBreakdown({
+  regularHours,
+  overtimeHours = 0,
+  nightHours = 0,
+  weekendHours = 0,
+  ratePenceHour,
+  adjustmentPence = 0,
+  periodDays,
+}) {
+  const baseGrossPence = Math.round(regularHours * ratePenceHour);
+  const overtimePence = Math.round(overtimeHours * ratePenceHour * 1.5);
+  const nightDifferentialPence = Math.round(nightHours * ratePenceHour * 0.15);
+  const weekendDifferentialPence = Math.round(weekendHours * ratePenceHour * 0.1);
+  const grossBeforePensionPence = Math.max(
+    0,
+    baseGrossPence + overtimePence + nightDifferentialPence + weekendDifferentialPence + adjustmentPence
+  );
+  const pensionEmployeePence = Math.round(grossBeforePensionPence * 0.05);
+  const pensionEmployerPence = Math.round(grossBeforePensionPence * 0.03);
+  const taxableGrossPence = Math.max(0, grossBeforePensionPence - pensionEmployeePence);
+  const d = computeUkDeductions(taxableGrossPence, periodDays);
+  return {
+    regularHours,
+    overtimeHours,
+    nightHours,
+    weekendHours,
+    baseGrossPence,
+    overtimePence,
+    nightDifferentialPence,
+    weekendDifferentialPence,
+    adjustmentPence,
+    grossPence: grossBeforePensionPence,
+    pensionEmployeePence,
+    pensionEmployerPence,
+    payePence: d.payePence,
+    niEmployeePence: d.niEmployeePence,
+    niEmployerPence: d.niEmployerPence,
+    netPence: Math.max(0, d.netPence - pensionEmployeePence),
+    note: 'Configurable payroll model. Verify tax, pension, overtime, and differential rules before production payroll submission.',
+  };
+}
+
 export function periodDaysInclusive(startStr, endStr) {
   const a = new Date(`${startStr}T12:00:00Z`);
   const b = new Date(`${endStr}T12:00:00Z`);

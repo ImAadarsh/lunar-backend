@@ -1,4 +1,4 @@
-import { computeUkDeductions, periodDaysInclusive, DEFAULT_PAY_PENCE_HOUR } from './payrollUk.js';
+import { computePayrollBreakdown, periodDaysInclusive, DEFAULT_PAY_PENCE_HOUR } from './payrollUk.js';
 
 /**
  * @param {import('mysql2/promise').Pool} pool
@@ -13,7 +13,11 @@ export async function processPayrollRun(pool, runId, periodStart, periodEnd) {
 
   const [hoursRows] = await pool.query(
     `SELECT a.user_id AS userId,
-            SUM(TIMESTAMPDIFF(MINUTE, a.check_in_at, a.check_out_at)) / 60.0 AS hours
+            SUM(TIMESTAMPDIFF(MINUTE, a.check_in_at, a.check_out_at)) / 60.0 AS hours,
+            SUM(CASE WHEN HOUR(a.check_in_at) >= 20 OR HOUR(a.check_in_at) < 6
+                THEN TIMESTAMPDIFF(MINUTE, a.check_in_at, a.check_out_at) ELSE 0 END) / 60.0 AS nightHours,
+            SUM(CASE WHEN DAYOFWEEK(a.check_in_at) IN (1, 7)
+                THEN TIMESTAMPDIFF(MINUTE, a.check_in_at, a.check_out_at) ELSE 0 END) / 60.0 AS weekendHours
      FROM attendance_sessions a
      WHERE a.status = 'closed'
        AND a.check_out_at IS NOT NULL
@@ -38,7 +42,11 @@ export async function processPayrollRun(pool, runId, periodStart, periodEnd) {
       [DEFAULT_PAY_PENCE_HOUR, row.userId]
     );
     const rate = Number(u?.rate ?? DEFAULT_PAY_PENCE_HOUR);
-    const baseGrossPence = Math.round(hours * rate);
+    const overtimeThreshold = periodDays > 10 ? 160 : 40;
+    const overtimeHours = Math.max(0, hours - overtimeThreshold);
+    const regularHours = Math.max(0, hours - overtimeHours);
+    const nightHours = Math.round(Number(row.nightHours ?? 0) * 100) / 100;
+    const weekendHours = Math.round(Number(row.weekendHours ?? 0) * 100) / 100;
     const [[adjustments]] = await pool.query(
       `SELECT COALESCE(SUM(amount_pence), 0) AS total
        FROM payroll_adjustments
@@ -46,9 +54,23 @@ export async function processPayrollRun(pool, runId, periodStart, periodEnd) {
       [runId, row.userId]
     );
     const adjustmentPence = Number(adjustments?.total ?? 0);
-    const grossPence = Math.max(0, baseGrossPence + adjustmentPence);
-
-    const d = computeUkDeductions(grossPence, periodDays);
+    const d = computePayrollBreakdown({
+      regularHours,
+      overtimeHours,
+      nightHours,
+      weekendHours,
+      ratePenceHour: rate,
+      adjustmentPence,
+      periodDays,
+    });
+    const grossPence = d.grossPence;
+    if (hours > overtimeThreshold) {
+      await pool.query(
+        `INSERT INTO payroll_exceptions (payroll_run_id, user_id, severity, code, message)
+         VALUES (?, ?, 'info', 'OVERTIME_APPLIED', ?)`,
+        [runId, row.userId, `${overtimeHours.toFixed(2)} overtime hours were applied.`]
+      ).catch(() => {});
+    }
 
     const [ins] = await pool.query(
       `INSERT INTO payroll_lines
@@ -63,7 +85,7 @@ export async function processPayrollRun(pool, runId, periodStart, periodEnd) {
         d.niEmployeePence,
         d.niEmployerPence,
         d.netPence,
-        JSON.stringify({ periodDays, ratePenceHour: rate, baseGrossPence, adjustmentPence }),
+        JSON.stringify({ periodDays, ratePenceHour: rate, ...d }),
       ]
     );
     lineIds.push(ins.insertId);
@@ -85,7 +107,7 @@ export async function processPayrollRun(pool, runId, periodStart, periodEnd) {
       niEmployerPence: niErTotal,
       netPence: netTotal,
     },
-    note: 'Illustrative UK-style deductions — verify for production use.',
+    note: 'Configurable UK-style payroll model with overtime, differential, pension, PAYE and NI breakdowns. Verify before production payroll submission.',
   };
 
   await pool.query(`UPDATE payroll_runs SET result_json = ?, notes = NULL WHERE id = ?`, [

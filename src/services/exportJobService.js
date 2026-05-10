@@ -1,4 +1,7 @@
 import { DEFAULT_PAY_PENCE_HOUR } from './payrollUk.js';
+import fs from 'fs';
+import ExcelJS from 'exceljs';
+import PDFDocument from 'pdfkit';
 
 function csvEscape(val) {
   if (val === null || val === undefined) return '';
@@ -13,6 +16,70 @@ function rowsToCsv(headers, rows) {
     lines.push(row.map(csvEscape).join(','));
   }
   return `${lines.join('\n')}\n`;
+}
+
+function csvToMatrix(csv) {
+  return csv
+    .trimEnd()
+    .split('\n')
+    .map((line) => {
+      const out = [];
+      let cur = '';
+      let quoted = false;
+      for (let i = 0; i < line.length; i++) {
+        const c = line[i];
+        const next = line[i + 1];
+        if (quoted) {
+          if (c === '"' && next === '"') {
+            cur += '"';
+            i++;
+          } else if (c === '"') {
+            quoted = false;
+          } else {
+            cur += c;
+          }
+        } else if (c === '"') {
+          quoted = true;
+        } else if (c === ',') {
+          out.push(cur);
+          cur = '';
+        } else {
+          cur += c;
+        }
+      }
+      out.push(cur);
+      return out;
+    });
+}
+
+export async function writeExportFile({ csv, outputFormat, absPath, title }) {
+  if (outputFormat === 'xlsx') {
+    const wb = new ExcelJS.Workbook();
+    const ws = wb.addWorksheet('Export');
+    for (const row of csvToMatrix(csv)) ws.addRow(row);
+    ws.getRow(1).font = { bold: true };
+    await wb.xlsx.writeFile(absPath);
+    return { mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' };
+  }
+  if (outputFormat === 'pdf') {
+    await new Promise((resolve, reject) => {
+      const doc = new PDFDocument({ margin: 36, size: 'A4', layout: 'landscape' });
+      const out = fs.createWriteStream(absPath);
+      out.on('finish', resolve);
+      out.on('error', reject);
+      doc.pipe(out);
+      doc.fontSize(16).text(title || 'Lunar Security Export', { align: 'center' });
+      doc.moveDown();
+      doc.fontSize(7);
+      const rows = csvToMatrix(csv).slice(0, 120);
+      for (const row of rows) doc.text(row.join(' | '), { lineGap: 2 });
+      if (csvToMatrix(csv).length > rows.length) doc.text('Output truncated for PDF preview. Use CSV/XLSX for full data.');
+      doc.end();
+    });
+    return { mime: 'application/pdf' };
+  }
+  fs.writeFileSync(absPath, csv, 'utf8');
+  return { mime: 'text/csv; charset=utf-8' };
 }
 
 /**

@@ -12,11 +12,13 @@ import { validate } from '../middleware/validate.js';
 import { env } from '../config/env.js';
 import { listCommandEvents, publishCommandEvent } from '../services/commandEventService.js';
 import { writeAudit } from '../utils/audit.js';
+import { ensurePayslipPdf } from '../services/payslipService.js';
 
 const router = Router();
 
 const exportBody = z.object({
   type: z.string().min(1),
+  outputFormat: z.enum(['csv', 'xlsx', 'pdf']).optional(),
   params: z.record(z.unknown()).optional(),
 });
 
@@ -48,6 +50,52 @@ const commandEventsQuery = z.object({
   limit: z.coerce.number().int().min(1).max(500).optional().default(100),
   siteId: z.coerce.number().int().optional(),
 });
+const availabilityBody = z.object({
+  userId: z.number().int(),
+  startsAt: z.string(),
+  endsAt: z.string(),
+  status: z.enum(['available', 'unavailable', 'preferred']).optional(),
+  reason: z.string().optional(),
+});
+const documentBody = z.object({
+  mediaId: z.number().int().optional(),
+  documentType: z.string().min(1),
+  title: z.string().min(1),
+  status: z.enum(['active', 'expired', 'archived']).optional(),
+  expiresOn: z.string().optional(),
+});
+const emergencyContactBody = z.object({
+  name: z.string().min(1),
+  relationship: z.string().optional(),
+  phone: z.string().min(1),
+  email: z.string().email().optional(),
+});
+const lifecycleBody = z.object({
+  eventType: z.enum(['onboarding', 'status_change', 'offboarding', 'archive']),
+  notes: z.string().optional(),
+  effectiveOn: z.string().optional(),
+});
+const trainingRequirementBody = z.object({
+  name: z.string().min(1),
+  description: z.string().optional(),
+  roleSlug: z.string().optional(),
+  renewalMonths: z.number().int().positive().optional(),
+  isActive: z.boolean().optional(),
+});
+const trainingCompletionBody = z.object({
+  userId: z.number().int(),
+  completedOn: z.string(),
+  expiresOn: z.string().optional(),
+  evidenceMediaId: z.number().int().optional(),
+});
+const siteAssetBody = z.object({
+  name: z.string().min(1),
+  assetType: z.string().min(1),
+  status: z.enum(['active', 'maintenance', 'retired']).optional(),
+  lat: z.number().optional(),
+  lng: z.number().optional(),
+  notes: z.string().optional(),
+});
 
 const withAuth = (...m) => [requireAuth, ...m];
 
@@ -73,6 +121,311 @@ router.get(
       missedCheckpointsEstimate: 0,
     });
   })
+  )
+);
+
+router.get(
+  '/telemetry/latest',
+  ...withAuth(
+    requireRoles('admin', 'supervisor'),
+    asyncHandler(async (_req, res) => {
+      const pool = getPool();
+      const [rows] = await pool.query(
+        `SELECT gp.user_id AS userId, u.email, gp.shift_id AS shiftId, s.site_id AS siteId,
+                gp.lat, gp.lng, gp.accuracy_m AS accuracyM, gp.recorded_at AS recordedAt
+         FROM gps_points gp
+         JOIN (
+           SELECT user_id, MAX(recorded_at) AS maxRecordedAt
+           FROM gps_points GROUP BY user_id
+         ) latest ON latest.user_id = gp.user_id AND latest.maxRecordedAt = gp.recorded_at
+         JOIN users u ON u.id = gp.user_id
+         JOIN shifts s ON s.id = gp.shift_id
+         ORDER BY gp.recorded_at DESC`
+      );
+      return ok(res, { items: rows });
+    })
+  )
+);
+
+router.get(
+  '/telemetry/trails',
+  ...withAuth(
+    requireRoles('admin', 'supervisor'),
+    asyncHandler(async (req, res) => {
+      const shiftId = Number(req.query.shiftId);
+      if (!Number.isInteger(shiftId)) throw new AppError(400, 'VALIDATION_ERROR', 'shiftId is required');
+      const pool = getPool();
+      const [rows] = await pool.query(
+        `SELECT id, user_id AS userId, shift_id AS shiftId, lat, lng, accuracy_m AS accuracyM, recorded_at AS recordedAt
+         FROM gps_points WHERE shift_id = ? ORDER BY recorded_at ASC LIMIT 2000`,
+        [shiftId]
+      );
+      return ok(res, { items: rows });
+    })
+  )
+);
+
+router.get(
+  '/availability',
+  ...withAuth(
+    requireRoles('admin', 'supervisor', 'guard'),
+    asyncHandler(async (req, res) => {
+      const pool = getPool();
+      const userId = req.auth.role === 'guard' ? req.auth.userId : Number(req.query.userId || 0);
+      const where = [];
+      const params = [];
+      if (userId) {
+        where.push('ea.user_id = ?');
+        params.push(userId);
+      }
+      const sqlWhere = where.length ? `WHERE ${where.join(' AND ')}` : '';
+      const [rows] = await pool.query(
+        `SELECT ea.id, ea.user_id AS userId, u.email, ea.starts_at AS startsAt, ea.ends_at AS endsAt,
+                ea.status, ea.reason, ea.created_at AS createdAt
+         FROM employee_availability ea
+         JOIN users u ON u.id = ea.user_id
+         ${sqlWhere}
+         ORDER BY ea.starts_at DESC LIMIT 500`,
+        params
+      );
+      return ok(res, { items: rows });
+    })
+  )
+);
+
+router.post(
+  '/availability',
+  ...withAuth(
+    requireRoles('admin', 'supervisor', 'guard'),
+    validate(availabilityBody),
+    asyncHandler(async (req, res) => {
+      const b = req.validated.body;
+      if (req.auth.role === 'guard' && b.userId !== req.auth.userId) {
+        throw new AppError(403, 'FORBIDDEN', 'Guards can only manage their own availability');
+      }
+      const pool = getPool();
+      const [r] = await pool.query(
+        `INSERT INTO employee_availability (user_id, starts_at, ends_at, status, reason, created_by)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [
+          b.userId,
+          b.startsAt.slice(0, 19).replace('T', ' '),
+          b.endsAt.slice(0, 19).replace('T', ' '),
+          b.status ?? 'unavailable',
+          b.reason ?? null,
+          req.auth.userId,
+        ]
+      );
+      await writeAudit({
+        userId: req.auth.userId,
+        action: 'availability.create',
+        entityType: 'employee_availability',
+        entityId: r.insertId,
+        payload: b,
+        ip: req.ip,
+      });
+      return ok(res, { id: r.insertId }, 201);
+    })
+  )
+);
+
+router.get(
+  '/hr/users/:userId',
+  ...withAuth(
+    requireRoles('admin', 'supervisor'),
+    asyncHandler(async (req, res) => {
+      const userId = Number(req.params.userId);
+      const pool = getPool();
+      const [[user]] = await pool.query(
+        `SELECT u.id, u.email, u.phone, u.status, r.slug AS role, u.created_at AS createdAt
+         FROM users u JOIN roles r ON r.id = u.role_id WHERE u.id = ?`,
+        [userId]
+      );
+      if (!user) throw new AppError(404, 'NOT_FOUND', 'User not found');
+      const [documents] = await pool.query(
+        `SELECT id, media_id AS mediaId, document_type AS documentType, title, status, expires_on AS expiresOn, created_at AS createdAt
+         FROM employee_documents WHERE user_id = ? ORDER BY id DESC`,
+        [userId]
+      );
+      const [contacts] = await pool.query(
+        `SELECT id, name, relationship, phone, email, created_at AS createdAt
+         FROM employee_emergency_contacts WHERE user_id = ? ORDER BY id DESC`,
+        [userId]
+      );
+      const [lifecycle] = await pool.query(
+        `SELECT id, event_type AS eventType, notes, effective_on AS effectiveOn, created_at AS createdAt
+         FROM employee_lifecycle_events WHERE user_id = ? ORDER BY id DESC`,
+        [userId]
+      );
+      return ok(res, { user, documents, emergencyContacts: contacts, lifecycle });
+    })
+  )
+);
+
+router.post(
+  '/hr/users/:userId/documents',
+  ...withAuth(
+    requireRoles('admin', 'supervisor'),
+    validate(documentBody),
+    asyncHandler(async (req, res) => {
+      const userId = Number(req.params.userId);
+      const b = req.validated.body;
+      const pool = getPool();
+      const [r] = await pool.query(
+        `INSERT INTO employee_documents (user_id, media_id, document_type, title, status, expires_on, uploaded_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [userId, b.mediaId ?? null, b.documentType, b.title, b.status ?? 'active', b.expiresOn ?? null, req.auth.userId]
+      );
+      await writeAudit({
+        userId: req.auth.userId,
+        action: 'hr.document.create',
+        entityType: 'employee_document',
+        entityId: r.insertId,
+        payload: { userId, documentType: b.documentType },
+        ip: req.ip,
+      });
+      return ok(res, { id: r.insertId }, 201);
+    })
+  )
+);
+
+router.post(
+  '/hr/users/:userId/emergency-contacts',
+  ...withAuth(
+    requireRoles('admin', 'supervisor'),
+    validate(emergencyContactBody),
+    asyncHandler(async (req, res) => {
+      const userId = Number(req.params.userId);
+      const b = req.validated.body;
+      const pool = getPool();
+      const [r] = await pool.query(
+        `INSERT INTO employee_emergency_contacts (user_id, name, relationship, phone, email)
+         VALUES (?, ?, ?, ?, ?)`,
+        [userId, b.name, b.relationship ?? null, b.phone, b.email ?? null]
+      );
+      return ok(res, { id: r.insertId }, 201);
+    })
+  )
+);
+
+router.post(
+  '/hr/users/:userId/lifecycle',
+  ...withAuth(
+    requireRoles('admin', 'supervisor'),
+    validate(lifecycleBody),
+    asyncHandler(async (req, res) => {
+      const userId = Number(req.params.userId);
+      const b = req.validated.body;
+      const pool = getPool();
+      const [r] = await pool.query(
+        `INSERT INTO employee_lifecycle_events (user_id, event_type, notes, effective_on, created_by)
+         VALUES (?, ?, ?, ?, ?)`,
+        [userId, b.eventType, b.notes ?? null, b.effectiveOn ?? null, req.auth.userId]
+      );
+      if (b.eventType === 'archive' || b.eventType === 'offboarding') {
+        await pool.query(`UPDATE users SET status = 'suspended' WHERE id = ?`, [userId]);
+      }
+      await writeAudit({
+        userId: req.auth.userId,
+        action: `hr.${b.eventType}`,
+        entityType: 'user',
+        entityId: userId,
+        payload: b,
+        ip: req.ip,
+      });
+      return ok(res, { id: r.insertId }, 201);
+    })
+  )
+);
+
+router.get(
+  '/training/requirements',
+  ...withAuth(
+    requireRoles('admin', 'supervisor'),
+    asyncHandler(async (_req, res) => {
+      const pool = getPool();
+      const [rows] = await pool.query(
+        `SELECT id, name, description, role_slug AS roleSlug, renewal_months AS renewalMonths,
+                is_active AS isActive, created_at AS createdAt
+         FROM training_requirements ORDER BY is_active DESC, name`
+      );
+      return ok(res, { items: rows });
+    })
+  )
+);
+
+router.post(
+  '/training/requirements',
+  ...withAuth(
+    requireRoles('admin'),
+    validate(trainingRequirementBody),
+    asyncHandler(async (req, res) => {
+      const b = req.validated.body;
+      const pool = getPool();
+      const [r] = await pool.query(
+        `INSERT INTO training_requirements (name, description, role_slug, renewal_months, is_active)
+         VALUES (?, ?, ?, ?, ?)`,
+        [b.name, b.description ?? null, b.roleSlug ?? 'guard', b.renewalMonths ?? null, b.isActive === false ? 0 : 1]
+      );
+      return ok(res, { id: r.insertId }, 201);
+    })
+  )
+);
+
+router.post(
+  '/training/requirements/:id/completions',
+  ...withAuth(
+    requireRoles('admin', 'supervisor'),
+    validate(trainingCompletionBody),
+    asyncHandler(async (req, res) => {
+      const requirementId = Number(req.params.id);
+      const b = req.validated.body;
+      const pool = getPool();
+      await pool.query(
+        `INSERT INTO training_completions
+          (requirement_id, user_id, completed_on, expires_on, evidence_media_id, created_by)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE completed_on = VALUES(completed_on), expires_on = VALUES(expires_on),
+           evidence_media_id = VALUES(evidence_media_id), created_by = VALUES(created_by)`,
+        [requirementId, b.userId, b.completedOn, b.expiresOn ?? null, b.evidenceMediaId ?? null, req.auth.userId]
+      );
+      await writeAudit({
+        userId: req.auth.userId,
+        action: 'training.completion.upsert',
+        entityType: 'training_requirement',
+        entityId: requirementId,
+        payload: b,
+        ip: req.ip,
+      });
+      return ok(res, { requirementId, userId: b.userId });
+    })
+  )
+);
+
+router.get(
+  '/training/compliance',
+  ...withAuth(
+    requireRoles('admin', 'supervisor'),
+    asyncHandler(async (_req, res) => {
+      const pool = getPool();
+      const [rows] = await pool.query(
+        `SELECT u.id AS userId, u.email, tr.id AS requirementId, tr.name,
+                tc.completed_on AS completedOn, tc.expires_on AS expiresOn,
+                CASE
+                  WHEN tc.id IS NULL THEN 'missing'
+                  WHEN tc.expires_on IS NOT NULL AND tc.expires_on < CURDATE() THEN 'expired'
+                  WHEN tc.expires_on IS NOT NULL AND tc.expires_on <= DATE_ADD(CURDATE(), INTERVAL 30 DAY) THEN 'expiring'
+                  ELSE 'compliant'
+                END AS status
+         FROM users u
+         JOIN roles r ON r.id = u.role_id
+         JOIN training_requirements tr ON tr.role_slug = r.slug AND tr.is_active = 1
+         LEFT JOIN training_completions tc ON tc.requirement_id = tr.id AND tc.user_id = u.id
+         WHERE u.status = 'active'
+         ORDER BY u.email, tr.name`
+      );
+      return ok(res, { items: rows });
+    })
   )
 );
 
@@ -154,19 +507,20 @@ router.post(
     requireRoles('admin', 'supervisor'),
   validate(exportBody),
   asyncHandler(async (req, res) => {
-    const { type, params } = req.validated.body;
+    const { type, outputFormat, params } = req.validated.body;
+    const format = outputFormat ?? (typeof params?.format === 'string' ? params.format : 'csv');
     const pool = getPool();
     const paramsJson = params !== undefined ? JSON.stringify(params) : null;
     const [r] = await pool.query(
-      `INSERT INTO export_jobs (type, status, created_by, params) VALUES (?, 'queued', ?, ?)`,
-      [type, req.auth.userId, paramsJson]
+      `INSERT INTO export_jobs (type, output_format, status, created_by, params) VALUES (?, ?, 'queued', ?, ?)`,
+      [type, format, req.auth.userId, paramsJson]
     );
     await writeAudit({
       userId: req.auth.userId,
       action: 'export.queue',
       entityType: 'export_job',
       entityId: r.insertId,
-      payload: { type, params: params ?? {} },
+      payload: { type, outputFormat: format, params: params ?? {} },
       ip: req.ip,
     });
     await publishCommandEvent({
@@ -174,9 +528,9 @@ router.post(
       actorUserId: req.auth.userId,
       entityType: 'export_job',
       entityId: r.insertId,
-      payload: { type },
+      payload: { type, outputFormat: format },
     });
-    return ok(res, { id: r.insertId, status: 'queued', params: params ?? {} }, 201);
+    return ok(res, { id: r.insertId, status: 'queued', outputFormat: format, params: params ?? {} }, 201);
   })
   )
 );
@@ -189,7 +543,8 @@ router.get(
     const id = Number(req.params.id);
     const pool = getPool();
     const [rows] = await pool.query(
-      `SELECT id, file_path AS filePath, status, error_message AS errorMessage FROM export_jobs WHERE id = ?`,
+      `SELECT id, output_format AS outputFormat, file_path AS filePath, file_mime AS fileMime,
+              status, error_message AS errorMessage FROM export_jobs WHERE id = ?`,
       [id]
     );
     const job = rows[0];
@@ -202,8 +557,9 @@ router.get(
     }
     const abs = path.isAbsolute(job.filePath) ? job.filePath : path.join(process.cwd(), job.filePath);
     if (!fs.existsSync(abs)) throw new AppError(404, 'NOT_FOUND', 'File missing on disk');
-    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-    res.setHeader('Content-Disposition', `attachment; filename="export-${id}.csv"`);
+    const ext = job.outputFormat || path.extname(abs).replace('.', '') || 'csv';
+    res.setHeader('Content-Type', job.fileMime || 'application/octet-stream');
+    res.setHeader('Content-Disposition', `attachment; filename="export-${id}.${ext}"`);
     fs.createReadStream(abs).pipe(res);
   })
   )
@@ -217,7 +573,7 @@ router.get(
     const id = Number(req.params.id);
     const pool = getPool();
     const [rows] = await pool.query(
-      `SELECT id, type, status, file_url AS fileUrl, params, error_message AS errorMessage,
+      `SELECT id, type, output_format AS outputFormat, status, file_url AS fileUrl, params, error_message AS errorMessage,
               created_at AS createdAt FROM export_jobs WHERE id = ?`,
       [id]
     );
@@ -457,7 +813,8 @@ router.get(
       const pool = getPool();
       const [rows] = await pool.query(
         `SELECT id, payroll_run_id AS payrollRunId, user_id AS userId, payroll_line_id AS payrollLineId,
-                status, payload, issued_at AS issuedAt, created_at AS createdAt
+                status, payload, file_path AS filePath, file_mime AS fileMime,
+                issued_at AS issuedAt, sent_at AS sentAt, read_at AS readAt, created_at AS createdAt
          FROM payslips
          WHERE payroll_run_id = ?
          ORDER BY id`,
@@ -469,6 +826,54 @@ router.get(
           payload: typeof row.payload === 'string' ? JSON.parse(row.payload) : row.payload,
         })),
       });
+    })
+  )
+);
+
+router.get(
+  '/payroll/payslips/:id/file',
+  ...withAuth(
+    requireRoles('admin', 'guard'),
+    asyncHandler(async (req, res) => {
+      const id = Number(req.params.id);
+      const pool = getPool();
+      const payslip = await ensurePayslipPdf(pool, id);
+      if (!payslip) throw new AppError(404, 'NOT_FOUND', 'Payslip not found');
+      if (req.auth.role === 'guard' && Number(payslip.user_id) !== req.auth.userId) {
+        throw new AppError(403, 'FORBIDDEN', 'Denied');
+      }
+      if (req.auth.role === 'guard') {
+        await pool.query(`UPDATE payslips SET read_at = COALESCE(read_at, NOW()) WHERE id = ?`, [id]);
+      }
+      const abs = path.isAbsolute(payslip.file_path)
+        ? payslip.file_path
+        : path.join(process.cwd(), payslip.file_path);
+      if (!fs.existsSync(abs)) throw new AppError(404, 'NOT_FOUND', 'Payslip file missing');
+      res.setHeader('Content-Type', payslip.file_mime || 'application/pdf');
+      res.setHeader('Content-Disposition', `attachment; filename="payslip-${id}.pdf"`);
+      fs.createReadStream(abs).pipe(res);
+    })
+  )
+);
+
+router.post(
+  '/payroll/payslips/:id/send',
+  ...withAuth(
+    requireRoles('admin'),
+    asyncHandler(async (req, res) => {
+      const id = Number(req.params.id);
+      const pool = getPool();
+      const payslip = await ensurePayslipPdf(pool, id);
+      if (!payslip) throw new AppError(404, 'NOT_FOUND', 'Payslip not found');
+      await pool.query(`UPDATE payslips SET sent_at = NOW(), status = 'sent' WHERE id = ?`, [id]);
+      await writeAudit({
+        userId: req.auth.userId,
+        action: 'payslip.send',
+        entityType: 'payslip',
+        entityId: id,
+        ip: req.ip,
+      });
+      return ok(res, { id, sent: true });
     })
   )
 );

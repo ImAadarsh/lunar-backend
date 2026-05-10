@@ -10,7 +10,7 @@ dotenv.config();
 
 import { getPool } from '../db/pool.js';
 import { env } from '../config/env.js';
-import { buildExportCsv } from '../services/exportJobService.js';
+import { buildExportCsv, writeExportFile } from '../services/exportJobService.js';
 import { processPayrollRun } from '../services/payrollRunService.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -38,7 +38,7 @@ async function tableExists(conn, name) {
 
 async function processExports(conn) {
   const [jobs] = await conn.query(
-    `SELECT id, type, params FROM export_jobs WHERE status = 'queued' ORDER BY id ASC LIMIT 5`
+    `SELECT id, type, output_format AS outputFormat, params FROM export_jobs WHERE status = 'queued' ORDER BY id ASC LIMIT 5`
   );
   for (const j of jobs) {
     await conn.query(`UPDATE export_jobs SET status = 'running' WHERE id = ?`, [j.id]);
@@ -49,14 +49,15 @@ async function processExports(conn) {
       }
       const csv = await buildExportCsv(conn, j.type, params);
       const dir = exportsDir();
-      const filename = `export-${j.id}.csv`;
+      const outputFormat = ['csv', 'xlsx', 'pdf'].includes(j.outputFormat) ? j.outputFormat : 'csv';
+      const filename = `export-${j.id}.${outputFormat}`;
       const absPath = path.join(dir, filename);
-      fs.writeFileSync(absPath, csv, 'utf8');
+      const { mime } = await writeExportFile({ csv, outputFormat, absPath, title: `${j.type} export` });
       const relPath = path.relative(process.cwd(), absPath);
       const fileUrl = publicDownloadUrl(j.id);
       await conn.query(
-        `UPDATE export_jobs SET status = 'done', file_url = ?, file_path = ?, error_message = NULL WHERE id = ?`,
-        [fileUrl, relPath, j.id]
+        `UPDATE export_jobs SET status = 'done', file_url = ?, file_path = ?, file_mime = ?, error_message = NULL WHERE id = ?`,
+        [fileUrl, relPath, mime, j.id]
       );
       console.log(`[worker] export_jobs ${j.id} -> done (${relPath})`);
     } catch (e) {
