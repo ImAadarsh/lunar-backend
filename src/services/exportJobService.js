@@ -111,6 +111,110 @@ export async function buildExportCsv(pool, type, params) {
     return rowsToCsv(['id', 'name', 'address', 'center_lat', 'center_lng', 'geofence_radius_m', 'is_active'], data);
   }
 
+  if (type === 'staffing_utilization') {
+    if (!from || !to) {
+      return rowsToCsv(['error'], [['params.from and params.to (YYYY-MM-DD) are required for staffing_utilization export']]);
+    }
+    const [rows] = await pool.query(
+      `SELECT u.id AS user_id, u.email,
+              COUNT(DISTINCT s.id) AS scheduled_shifts,
+              COALESCE(SUM(TIMESTAMPDIFF(MINUTE, a.check_in_at, a.check_out_at)) / 60.0, 0) AS worked_hours,
+              SUM(CASE WHEN a.id IS NOT NULL THEN 1 ELSE 0 END) AS attended_sessions
+       FROM users u
+       JOIN roles r ON r.id = u.role_id AND r.slug = 'guard'
+       LEFT JOIN shifts s
+         ON s.user_id = u.id
+        AND s.starts_at <= ?
+        AND s.ends_at >= ?
+       LEFT JOIN attendance_sessions a
+         ON a.shift_id = s.id
+        AND a.status = 'closed'
+       GROUP BY u.id, u.email
+       ORDER BY worked_hours DESC, u.email`,
+      [`${to} 23:59:59`, `${from} 00:00:00`]
+    );
+    const data = rows.map((r) => [
+      r.user_id,
+      r.email,
+      r.scheduled_shifts,
+      Number(r.worked_hours).toFixed(2),
+      r.attended_sessions,
+    ]);
+    return rowsToCsv(['user_id', 'email', 'scheduled_shifts', 'worked_hours', 'attended_sessions'], data);
+  }
+
+  if (type === 'patrol_compliance') {
+    if (!from || !to) {
+      return rowsToCsv(['error'], [['params.from and params.to (YYYY-MM-DD) are required for patrol_compliance export']]);
+    }
+    const [rows] = await pool.query(
+      `SELECT si.id AS site_id, si.name AS site_name, c.id AS checkpoint_id, c.label,
+              COUNT(ps.id) AS scans,
+              MAX(ps.scanned_at) AS last_scan_at
+       FROM checkpoints c
+       JOIN sites si ON si.id = c.site_id
+       LEFT JOIN patrol_scans ps
+         ON ps.checkpoint_id = c.id
+        AND ps.scanned_at BETWEEN ? AND ?
+       GROUP BY si.id, si.name, c.id, c.label
+       ORDER BY si.name, c.sort_order, c.id`,
+      [`${from} 00:00:00`, `${to} 23:59:59`]
+    );
+    const data = rows.map((r) => [
+      r.site_id,
+      r.site_name,
+      r.checkpoint_id,
+      r.label,
+      r.scans,
+      r.last_scan_at ?? '',
+      Number(r.scans) > 0 ? 'scanned' : 'missed',
+    ]);
+    return rowsToCsv(['site_id', 'site_name', 'checkpoint_id', 'label', 'scans', 'last_scan_at', 'status'], data);
+  }
+
+  if (type === 'payroll_variance') {
+    const [rows] = await pool.query(
+      `SELECT pr.id AS payroll_run_id, pr.period_start, pr.period_end, pr.status,
+              pl.user_id, u.email, pl.hours_worked, pl.gross_pence, pl.net_pence,
+              JSON_EXTRACT(pl.meta_json, '$.baseGrossPence') AS base_gross_pence,
+              JSON_EXTRACT(pl.meta_json, '$.adjustmentPence') AS adjustment_pence
+       FROM payroll_lines pl
+       JOIN payroll_runs pr ON pr.id = pl.payroll_run_id
+       JOIN users u ON u.id = pl.user_id
+       ORDER BY pr.id DESC, u.email
+       LIMIT 10000`
+    );
+    const data = rows.map((r) => [
+      r.payroll_run_id,
+      r.period_start,
+      r.period_end,
+      r.status,
+      r.user_id,
+      r.email,
+      r.hours_worked,
+      r.base_gross_pence ?? '',
+      r.adjustment_pence ?? '',
+      r.gross_pence,
+      r.net_pence,
+    ]);
+    return rowsToCsv(
+      [
+        'payroll_run_id',
+        'period_start',
+        'period_end',
+        'status',
+        'user_id',
+        'email',
+        'hours_worked',
+        'base_gross_pence',
+        'adjustment_pence',
+        'gross_pence',
+        'net_pence',
+      ],
+      data
+    );
+  }
+
   if (type === 'bacs_stub' || type === 'bacs_payments') {
     const [rows] = await pool.query(
       `SELECT u.id, u.email,
@@ -132,5 +236,5 @@ export async function buildExportCsv(pool, type, params) {
     return `${lines.join('\n')}\n`;
   }
 
-  return rowsToCsv(['message'], [[`Unknown export type "${type}" — use users, audit_logs, attendance, incidents, sites, or bacs_stub`]]);
+  return rowsToCsv(['message'], [[`Unknown export type "${type}" — use users, audit_logs, attendance, incidents, sites, staffing_utilization, patrol_compliance, payroll_variance, or bacs_stub`]]);
 }

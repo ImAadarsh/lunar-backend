@@ -17,3 +17,49 @@ export function isInsideCircularGeofence(site, lat, lng) {
   const d = distanceMeters(lat, lng, site.center_lat, site.center_lng);
   return d <= Number(site.geofence_radius_m);
 }
+
+function normalizePolygon(raw) {
+  if (!raw) return null;
+  const value = typeof raw === 'string' ? JSON.parse(raw) : raw;
+  const points = Array.isArray(value?.coordinates)
+    ? value.coordinates
+    : Array.isArray(value?.points)
+      ? value.points
+      : Array.isArray(value)
+        ? value
+        : null;
+  if (!points || points.length < 3) return null;
+  return points
+    .map((p) => {
+      if (Array.isArray(p)) return { lat: Number(p[0]), lng: Number(p[1]) };
+      return { lat: Number(p.lat ?? p.latitude), lng: Number(p.lng ?? p.longitude) };
+    })
+    .filter((p) => Number.isFinite(p.lat) && Number.isFinite(p.lng));
+}
+
+function isInsidePolygon(rawPolygon, lat, lng) {
+  const polygon = normalizePolygon(rawPolygon);
+  if (!polygon || polygon.length < 3) return true;
+
+  const y = Number(lat);
+  const x = Number(lng);
+  let inside = false;
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+    const yi = polygon[i].lat;
+    const xi = polygon[i].lng;
+    const yj = polygon[j].lat;
+    const xj = polygon[j].lng;
+    const intersects = yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi;
+    if (intersects) inside = !inside;
+  }
+  return inside;
+}
+
+/**
+ * Prefer precise polygon fences when present; fall back to the existing circular
+ * radius check for sites that only have a center point.
+ */
+export function isInsideGeofence(site, lat, lng) {
+  if (site.geofence_polygon) return isInsidePolygon(site.geofence_polygon, lat, lng);
+  return isInsideCircularGeofence(site, lat, lng);
+}

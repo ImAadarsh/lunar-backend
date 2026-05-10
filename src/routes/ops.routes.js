@@ -10,6 +10,8 @@ import { requireAuth } from '../middleware/auth.js';
 import { requireRoles } from '../middleware/rbac.js';
 import { validate } from '../middleware/validate.js';
 import { env } from '../config/env.js';
+import { listCommandEvents, publishCommandEvent } from '../services/commandEventService.js';
+import { writeAudit } from '../utils/audit.js';
 
 const router = Router();
 
@@ -22,6 +24,15 @@ const payrollBody = z.object({
   periodStart: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   periodEnd: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
 });
+const payrollAdjustmentBody = z.object({
+  userId: z.number().int(),
+  kind: z.enum(['bonus', 'deduction', 'correction', 'other']).optional(),
+  amountPence: z.number().int(),
+  reason: z.string().max(512).optional(),
+});
+const payrollStatusBody = z.object({
+  status: z.enum(['approved', 'finalized']),
+});
 
 const certBody = z.object({
   userId: z.number().int(),
@@ -32,6 +43,11 @@ const certBody = z.object({
 });
 
 const certPatch = certBody.partial().omit({ userId: true });
+const commandEventsQuery = z.object({
+  sinceId: z.coerce.number().int().min(0).optional().default(0),
+  limit: z.coerce.number().int().min(1).max(500).optional().default(100),
+  siteId: z.coerce.number().int().optional(),
+});
 
 const withAuth = (...m) => [requireAuth, ...m];
 
@@ -57,6 +73,57 @@ router.get(
       missedCheckpointsEstimate: 0,
     });
   })
+  )
+);
+
+router.get(
+  '/command/events',
+  ...withAuth(
+    requireRoles('admin', 'supervisor'),
+    validate(commandEventsQuery, 'query'),
+    asyncHandler(async (req, res) => {
+      const q = req.validated.query;
+      const events = await listCommandEvents({
+        sinceId: q.sinceId,
+        limit: q.limit,
+        siteId: q.siteId ?? null,
+      });
+      return ok(res, { items: events });
+    })
+  )
+);
+
+router.get(
+  '/command/events/stream',
+  ...withAuth(
+    requireRoles('admin', 'supervisor'),
+    validate(commandEventsQuery, 'query'),
+    asyncHandler(async (req, res) => {
+      let sinceId = req.validated.query.sinceId;
+      const siteId = req.validated.query.siteId ?? null;
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('Connection', 'keep-alive');
+      res.flushHeaders?.();
+
+      const send = async () => {
+        const events = await listCommandEvents({ sinceId, limit: 100, siteId });
+        for (const event of events) {
+          sinceId = Math.max(sinceId, Number(event.id));
+          res.write(`id: ${event.id}\n`);
+          res.write(`event: ${event.type}\n`);
+          res.write(`data: ${JSON.stringify(event)}\n\n`);
+        }
+      };
+
+      await send();
+      const interval = setInterval(() => {
+        send().catch((e) => {
+          res.write(`event: error\ndata: ${JSON.stringify({ message: e.message })}\n\n`);
+        });
+      }, 5000);
+      req.on('close', () => clearInterval(interval));
+    })
   )
 );
 
@@ -94,6 +161,21 @@ router.post(
       `INSERT INTO export_jobs (type, status, created_by, params) VALUES (?, 'queued', ?, ?)`,
       [type, req.auth.userId, paramsJson]
     );
+    await writeAudit({
+      userId: req.auth.userId,
+      action: 'export.queue',
+      entityType: 'export_job',
+      entityId: r.insertId,
+      payload: { type, params: params ?? {} },
+      ip: req.ip,
+    });
+    await publishCommandEvent({
+      type: 'export.queued',
+      actorUserId: req.auth.userId,
+      entityType: 'export_job',
+      entityId: r.insertId,
+      payload: { type },
+    });
     return ok(res, { id: r.insertId, status: 'queued', params: params ?? {} }, 201);
   })
   )
@@ -245,8 +327,149 @@ router.post(
       `INSERT INTO payroll_runs (period_start, period_end, status, notes) VALUES (?, ?, 'draft', NULL)`,
       [periodStart, periodEnd]
     );
+    await writeAudit({
+      userId: req.auth.userId,
+      action: 'payroll.create',
+      entityType: 'payroll_run',
+      entityId: r.insertId,
+      payload: { periodStart, periodEnd },
+      ip: req.ip,
+    });
+    await publishCommandEvent({
+      type: 'payroll.created',
+      actorUserId: req.auth.userId,
+      entityType: 'payroll_run',
+      entityId: r.insertId,
+      payload: { periodStart, periodEnd },
+    });
     return ok(res, { id: r.insertId, status: 'draft' }, 201);
   })
+  )
+);
+
+router.post(
+  '/payroll/runs/:runId/adjustments',
+  ...withAuth(
+    requireRoles('admin'),
+    validate(payrollAdjustmentBody),
+    asyncHandler(async (req, res) => {
+      const runId = Number(req.params.runId);
+      const b = req.validated.body;
+      const pool = getPool();
+      const [[run]] = await pool.query(`SELECT id, status FROM payroll_runs WHERE id = ?`, [runId]);
+      if (!run) throw new AppError(404, 'NOT_FOUND', 'Payroll run not found');
+      if (!['draft', 'failed'].includes(run.status)) {
+        throw new AppError(409, 'CONFLICT', 'Adjustments can only be added before processing/approval');
+      }
+      const [r] = await pool.query(
+        `INSERT INTO payroll_adjustments
+          (payroll_run_id, user_id, kind, amount_pence, reason, created_by)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [runId, b.userId, b.kind ?? 'other', b.amountPence, b.reason ?? null, req.auth.userId]
+      );
+      await writeAudit({
+        userId: req.auth.userId,
+        action: 'payroll.adjustment.create',
+        entityType: 'payroll_adjustment',
+        entityId: r.insertId,
+        payload: { runId, userId: b.userId, kind: b.kind ?? 'other', amountPence: b.amountPence },
+        ip: req.ip,
+      });
+      return ok(res, { id: r.insertId }, 201);
+    })
+  )
+);
+
+router.patch(
+  '/payroll/runs/:runId/status',
+  ...withAuth(
+    requireRoles('admin'),
+    validate(payrollStatusBody),
+    asyncHandler(async (req, res) => {
+      const runId = Number(req.params.runId);
+      const { status } = req.validated.body;
+      const pool = getPool();
+      const [[run]] = await pool.query(`SELECT id, status FROM payroll_runs WHERE id = ?`, [runId]);
+      if (!run) throw new AppError(404, 'NOT_FOUND', 'Payroll run not found');
+      if (status === 'approved' && run.status !== 'completed') {
+        throw new AppError(409, 'CONFLICT', 'Only completed payroll runs can be approved');
+      }
+      if (status === 'finalized' && run.status !== 'approved') {
+        throw new AppError(409, 'CONFLICT', 'Only approved payroll runs can be finalized');
+      }
+
+      if (status === 'approved') {
+        await pool.query(
+          `UPDATE payroll_runs SET status = 'approved', approved_at = NOW(), approved_by = ? WHERE id = ?`,
+          [req.auth.userId, runId]
+        );
+      } else {
+        await pool.query(
+          `UPDATE payroll_runs SET status = 'finalized', finalized_at = NOW(), finalized_by = ? WHERE id = ?`,
+          [req.auth.userId, runId]
+        );
+        await pool.query(
+          `INSERT INTO payslips (payroll_run_id, user_id, payroll_line_id, status, payload, issued_at)
+           SELECT ?, pl.user_id, pl.id, 'issued',
+                  JSON_OBJECT(
+                    'payrollRunId', ?,
+                    'userId', pl.user_id,
+                    'hoursWorked', pl.hours_worked,
+                    'grossPence', pl.gross_pence,
+                    'payePence', pl.paye_pence,
+                    'niEmployeePence', pl.ni_employee_pence,
+                    'niEmployerPence', pl.ni_employer_pence,
+                    'netPence', pl.net_pence,
+                    'meta', pl.meta_json
+                  ),
+                  NOW()
+           FROM payroll_lines pl
+           WHERE pl.payroll_run_id = ?
+           ON DUPLICATE KEY UPDATE status = 'issued', payload = VALUES(payload), issued_at = NOW()`,
+          [runId, runId, runId]
+        );
+      }
+      await writeAudit({
+        userId: req.auth.userId,
+        action: `payroll.${status}`,
+        entityType: 'payroll_run',
+        entityId: runId,
+        ip: req.ip,
+      });
+      await publishCommandEvent({
+        type: `payroll.${status}`,
+        actorUserId: req.auth.userId,
+        entityType: 'payroll_run',
+        entityId: runId,
+        payload: { status },
+      });
+      return ok(res, { id: runId, status });
+    })
+  )
+);
+
+router.get(
+  '/payroll/runs/:runId/payslips',
+  ...withAuth(
+    requireRoles('admin'),
+    asyncHandler(async (req, res) => {
+      const runId = Number(req.params.runId);
+      const pool = getPool();
+      const [rows] = await pool.query(
+        `SELECT id, payroll_run_id AS payrollRunId, user_id AS userId, payroll_line_id AS payrollLineId,
+                status, payload, issued_at AS issuedAt, created_at AS createdAt
+         FROM payslips
+         WHERE payroll_run_id = ?
+         ORDER BY id`,
+        [runId]
+      );
+      return ok(res, {
+        items: rows.map((row) => ({
+          ...row,
+          payload: typeof row.payload === 'string' ? JSON.parse(row.payload) : row.payload,
+        })),
+      });
+    })
   )
 );
 
@@ -290,6 +513,14 @@ router.post(
        VALUES (?, ?, ?, ?, ?)`,
       [b.userId, b.name, b.issuer ?? null, b.obtainedOn ?? null, b.expiresOn ?? null]
     );
+    await writeAudit({
+      userId: req.auth.userId,
+      action: 'certification.create',
+      entityType: 'employee_certification',
+      entityId: r.insertId,
+      payload: { userId: b.userId, name: b.name },
+      ip: req.ip,
+    });
     return ok(res, { id: r.insertId }, 201);
   })
   )
@@ -329,6 +560,14 @@ router.patch(
       params
     );
     if (r.affectedRows === 0) throw new AppError(404, 'NOT_FOUND', 'Not found');
+    await writeAudit({
+      userId: req.auth.userId,
+      action: 'certification.update',
+      entityType: 'employee_certification',
+      entityId: id,
+      payload: b,
+      ip: req.ip,
+    });
     return ok(res, { updated: true });
   })
   )
@@ -343,6 +582,13 @@ router.delete(
     const pool = getPool();
     const [r] = await pool.query(`DELETE FROM employee_certifications WHERE id = ?`, [id]);
     if (r.affectedRows === 0) throw new AppError(404, 'NOT_FOUND', 'Not found');
+    await writeAudit({
+      userId: req.auth.userId,
+      action: 'certification.delete',
+      entityType: 'employee_certification',
+      entityId: id,
+      ip: req.ip,
+    });
     return ok(res, { deleted: true });
   })
   )

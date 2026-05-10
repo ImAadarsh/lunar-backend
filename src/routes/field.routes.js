@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import multer from 'multer';
 import { z } from 'zod';
 import { getPool } from '../db/pool.js';
@@ -12,8 +12,9 @@ import { ok } from '../utils/response.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireRoles } from '../middleware/rbac.js';
 import { validate } from '../middleware/validate.js';
-import { isInsideCircularGeofence } from '../utils/geo.js';
+import { isInsideGeofence } from '../utils/geo.js';
 import { writeAudit } from '../utils/audit.js';
+import { publishCommandEvent } from '../services/commandEventService.js';
 
 const router = Router();
 
@@ -122,6 +123,14 @@ const upload = multer({
 
 const withAuth = (...m) => [requireAuth, ...m];
 
+function sha256File(filePath) {
+  return createHash('sha256').update(fs.readFileSync(filePath)).digest('hex');
+}
+
+function mediaAccessToken() {
+  return randomBytes(32).toString('hex');
+}
+
 router.post(
   '/attendance/check-in',
   ...withAuth(
@@ -132,7 +141,7 @@ router.post(
     const pool = getPool();
     const [sh] = await pool.query(
       `SELECT s.id, s.user_id AS userId, s.site_id AS siteId, s.status,
-              si.center_lat, si.center_lng, si.geofence_radius_m
+              si.center_lat, si.center_lng, si.geofence_radius_m, si.geofence_polygon
        FROM shifts s JOIN sites si ON si.id = s.site_id WHERE s.id = ?`,
       [shiftId]
     );
@@ -140,7 +149,7 @@ router.post(
     if (!shift || shift.userId !== req.auth.userId) {
       throw new AppError(404, 'NOT_FOUND', 'Shift not found');
     }
-    if (!isInsideCircularGeofence(shift, lat, lng)) {
+    if (!isInsideGeofence(shift, lat, lng)) {
       throw new AppError(400, 'VALIDATION_ERROR', 'Outside geofence');
     }
     const [open] = await pool.query(
@@ -155,6 +164,23 @@ router.post(
       [req.auth.userId, shiftId, checkInAt, lat, lng]
     );
     await pool.query(`UPDATE shifts SET status = 'active' WHERE id = ? AND status = 'scheduled'`, [shiftId]);
+    await writeAudit({
+      userId: req.auth.userId,
+      action: 'attendance.check_in',
+      entityType: 'attendance_session',
+      entityId: r.insertId,
+      payload: { shiftId, lat, lng, siteId: shift.siteId },
+      ip: req.ip,
+    });
+    await publishCommandEvent({
+      type: 'attendance.check_in',
+      actorUserId: req.auth.userId,
+      subjectUserId: req.auth.userId,
+      siteId: Number(shift.siteId),
+      entityType: 'attendance_session',
+      entityId: r.insertId,
+      payload: { shiftId, lat, lng },
+    });
     return ok(res, { sessionId: r.insertId }, 201);
   })
   )
@@ -169,7 +195,7 @@ router.post(
     const { sessionId, lat, lng } = req.validated.body;
     const pool = getPool();
     const [rows] = await pool.query(
-      `SELECT a.id, a.shift_id, s.site_id, si.center_lat, si.center_lng, si.geofence_radius_m
+      `SELECT a.id, a.shift_id, s.site_id, si.center_lat, si.center_lng, si.geofence_radius_m, si.geofence_polygon
        FROM attendance_sessions a
        JOIN shifts s ON s.id = a.shift_id
        JOIN sites si ON si.id = s.site_id
@@ -178,13 +204,30 @@ router.post(
     );
     const row = rows[0];
     if (!row) throw new AppError(404, 'NOT_FOUND', 'Session not found');
-    const inside = isInsideCircularGeofence(row, lat, lng);
+    const inside = isInsideGeofence(row, lat, lng);
     const outAt = new Date().toISOString().slice(0, 19).replace('T', ' ');
     await pool.query(
       `UPDATE attendance_sessions SET check_out_at = ?, check_out_lat = ?, check_out_lng = ?,
        inside_geofence_out = ?, status = 'closed' WHERE id = ?`,
       [outAt, lat, lng, inside ? 1 : 0, sessionId]
     );
+    await writeAudit({
+      userId: req.auth.userId,
+      action: 'attendance.check_out',
+      entityType: 'attendance_session',
+      entityId: sessionId,
+      payload: { shiftId: row.shift_id, lat, lng, insideGeofence: inside },
+      ip: req.ip,
+    });
+    await publishCommandEvent({
+      type: 'attendance.check_out',
+      actorUserId: req.auth.userId,
+      subjectUserId: req.auth.userId,
+      siteId: Number(row.site_id),
+      entityType: 'attendance_session',
+      entityId: sessionId,
+      payload: { shiftId: row.shift_id, lat, lng, insideGeofence: inside },
+    });
     return ok(res, { closed: true });
   })
   )
@@ -251,6 +294,19 @@ router.post(
         );
       }
     }
+    await publishCommandEvent({
+      type: 'telemetry.gps',
+      actorUserId: req.auth.userId,
+      subjectUserId: req.auth.userId,
+      entityType: 'shift',
+      entityId: shiftId,
+      payload: {
+        shiftId,
+        batchId,
+        points: points.length,
+        latest: points[points.length - 1],
+      },
+    });
     return ok(res, { inserted: points.length, batchId }, 201);
   })
   )
@@ -264,6 +320,12 @@ router.post(
   asyncHandler(async (req, res) => {
     const { checkpointId, scannedAt, clientMessageId } = req.validated.body;
     const pool = getPool();
+    const [checkpointRows] = await pool.query(
+      `SELECT id, site_id AS siteId, label FROM checkpoints WHERE id = ?`,
+      [checkpointId]
+    );
+    if (!checkpointRows[0]) throw new AppError(400, 'VALIDATION_ERROR', 'Invalid checkpointId');
+    const checkpoint = checkpointRows[0];
     if (clientMessageId) {
       const [ex] = await pool.query(`SELECT id FROM patrol_scans WHERE client_message_id = ?`, [
         clientMessageId,
@@ -276,6 +338,23 @@ router.post(
          VALUES (?, ?, ?, ?)`,
         [req.auth.userId, checkpointId, scannedAt.slice(0, 23).replace('T', ' '), clientMessageId ?? null]
       );
+      await writeAudit({
+        userId: req.auth.userId,
+        action: 'patrol.scan',
+        entityType: 'patrol_scan',
+        entityId: r.insertId,
+        payload: { checkpointId, siteId: checkpoint.siteId, clientMessageId: clientMessageId ?? null },
+        ip: req.ip,
+      });
+      await publishCommandEvent({
+        type: 'patrol.scan',
+        actorUserId: req.auth.userId,
+        subjectUserId: req.auth.userId,
+        siteId: Number(checkpoint.siteId),
+        entityType: 'patrol_scan',
+        entityId: r.insertId,
+        payload: { checkpointId, checkpointLabel: checkpoint.label, scannedAt },
+      });
       return ok(res, { id: r.insertId }, 201);
     } catch (e) {
       if (e.code === 'ER_DUP_ENTRY' && clientMessageId) {
@@ -354,7 +433,17 @@ router.post(
       action: 'incident.create',
       entityType: 'incident',
       entityId: r.insertId,
+      payload: { siteId: b.siteId, category: b.category, title: b.title },
       ip: req.ip,
+    });
+    await publishCommandEvent({
+      type: 'incident.created',
+      actorUserId: req.auth.userId,
+      subjectUserId: req.auth.userId,
+      siteId: b.siteId,
+      entityType: 'incident',
+      entityId: r.insertId,
+      payload: { category: b.category, title: b.title },
     });
     return ok(res, { id: r.insertId }, 201);
   })
@@ -463,6 +552,24 @@ router.patch(
     const pool = getPool();
     const [r] = await pool.query(`UPDATE incidents SET status = ? WHERE id = ?`, [status, id]);
     if (r.affectedRows === 0) throw new AppError(404, 'NOT_FOUND', 'Not found');
+    const [rows] = await pool.query(`SELECT user_id AS userId, site_id AS siteId FROM incidents WHERE id = ?`, [id]);
+    await writeAudit({
+      userId: req.auth.userId,
+      action: 'incident.update_status',
+      entityType: 'incident',
+      entityId: id,
+      payload: { status },
+      ip: req.ip,
+    });
+    await publishCommandEvent({
+      type: 'incident.updated',
+      actorUserId: req.auth.userId,
+      subjectUserId: Number(rows[0]?.userId ?? 0) || null,
+      siteId: Number(rows[0]?.siteId ?? 0) || null,
+      entityType: 'incident',
+      entityId: id,
+      payload: { status },
+    });
     return ok(res, { updated: true });
   })
   )
@@ -488,6 +595,14 @@ router.post(
       if (e.code === 'ER_DUP_ENTRY') throw new AppError(409, 'CONFLICT', 'Already attached');
       throw e;
     }
+    await writeAudit({
+      userId: req.auth.userId,
+      action: 'incident.attach_media',
+      entityType: 'incident',
+      entityId: id,
+      payload: { mediaId },
+      ip: req.ip,
+    });
     return ok(res, { linked: true }, 201);
   })
   )
@@ -538,7 +653,16 @@ router.post(
       action: 'sos.trigger',
       entityType: 'sos',
       entityId: r.insertId,
+      payload: { lat, lng },
       ip: req.ip,
+    });
+    await publishCommandEvent({
+      type: 'sos.triggered',
+      actorUserId: req.auth.userId,
+      subjectUserId: req.auth.userId,
+      entityType: 'sos',
+      entityId: r.insertId,
+      payload: { lat, lng, message: message ?? null },
     });
     return ok(res, { id: r.insertId }, 201);
   })
@@ -575,6 +699,23 @@ router.patch(
       [status, status, id]
     );
     if (r.affectedRows === 0) throw new AppError(404, 'NOT_FOUND', 'Not found');
+    const [rows] = await pool.query(`SELECT user_id AS userId FROM sos_events WHERE id = ?`, [id]);
+    await writeAudit({
+      userId: req.auth.userId,
+      action: 'sos.update_status',
+      entityType: 'sos',
+      entityId: id,
+      payload: { status },
+      ip: req.ip,
+    });
+    await publishCommandEvent({
+      type: 'sos.updated',
+      actorUserId: req.auth.userId,
+      subjectUserId: Number(rows[0]?.userId ?? 0) || null,
+      entityType: 'sos',
+      entityId: id,
+      payload: { status },
+    });
     return ok(res, { updated: true });
   })
   )
@@ -650,13 +791,33 @@ router.post(
       const storageKey = req.file.filename;
       const origin = (env.publicBaseUrl || `${req.protocol}://${req.get('host')}`).replace(/\/$/, '');
       const publicUrl = `${origin}/uploads/${encodeURIComponent(storageKey)}`;
+      const sha256 = sha256File(req.file.path);
+      const accessToken = mediaAccessToken();
       const pool = getPool();
       try {
         const [r] = await pool.query(
-          `INSERT INTO media_assets (user_id, kind, storage_key, public_url, mime, size_bytes)
-           VALUES (?, ?, ?, ?, ?, ?)`,
-          [req.auth.userId, kind, storageKey, publicUrl, req.file.mimetype || null, req.file.size || null]
+          `INSERT INTO media_assets
+            (user_id, kind, storage_key, public_url, mime, size_bytes, sha256, access_token, processing_status)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'validated')`,
+          [
+            req.auth.userId,
+            kind,
+            storageKey,
+            publicUrl,
+            req.file.mimetype || null,
+            req.file.size || null,
+            sha256,
+            accessToken,
+          ]
         );
+        await writeAudit({
+          userId: req.auth.userId,
+          action: 'media.upload',
+          entityType: 'media_asset',
+          entityId: r.insertId,
+          payload: { kind, mime: req.file.mimetype || null, sizeBytes: req.file.size || null },
+          ip: req.ip,
+        });
         return ok(
           res,
           {
@@ -666,6 +827,7 @@ router.post(
             publicUrl,
             mime: req.file.mimetype || null,
             sizeBytes: req.file.size || null,
+            sha256,
           },
           201
         );
@@ -687,9 +849,11 @@ router.post(
   asyncHandler(async (req, res) => {
     const b = req.validated.body;
     const pool = getPool();
+    const accessToken = mediaAccessToken();
     const [r] = await pool.query(
-      `INSERT INTO media_assets (user_id, kind, storage_key, public_url, mime, size_bytes)
-       VALUES (?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO media_assets
+        (user_id, kind, storage_key, public_url, mime, size_bytes, access_token, processing_status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'stored')`,
       [
         req.auth.userId,
         b.kind ?? 'other',
@@ -697,8 +861,17 @@ router.post(
         b.publicUrl ?? null,
         b.mime ?? null,
         b.sizeBytes ?? null,
+        accessToken,
       ]
     );
+    await writeAudit({
+      userId: req.auth.userId,
+      action: 'media.register',
+      entityType: 'media_asset',
+      entityId: r.insertId,
+      payload: { kind: b.kind ?? 'other', storageKey: b.storageKey },
+      ip: req.ip,
+    });
     return ok(res, { id: r.insertId }, 201);
   })
   )

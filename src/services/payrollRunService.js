@@ -38,7 +38,15 @@ export async function processPayrollRun(pool, runId, periodStart, periodEnd) {
       [DEFAULT_PAY_PENCE_HOUR, row.userId]
     );
     const rate = Number(u?.rate ?? DEFAULT_PAY_PENCE_HOUR);
-    const grossPence = Math.round(hours * rate);
+    const baseGrossPence = Math.round(hours * rate);
+    const [[adjustments]] = await pool.query(
+      `SELECT COALESCE(SUM(amount_pence), 0) AS total
+       FROM payroll_adjustments
+       WHERE payroll_run_id = ? AND user_id = ?`,
+      [runId, row.userId]
+    );
+    const adjustmentPence = Number(adjustments?.total ?? 0);
+    const grossPence = Math.max(0, baseGrossPence + adjustmentPence);
 
     const d = computeUkDeductions(grossPence, periodDays);
 
@@ -55,7 +63,7 @@ export async function processPayrollRun(pool, runId, periodStart, periodEnd) {
         d.niEmployeePence,
         d.niEmployerPence,
         d.netPence,
-        JSON.stringify({ periodDays, ratePenceHour: rate }),
+        JSON.stringify({ periodDays, ratePenceHour: rate, baseGrossPence, adjustmentPence }),
       ]
     );
     lineIds.push(ins.insertId);

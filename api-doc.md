@@ -120,6 +120,8 @@ Body: `{ "email", "password", "role": "admin"|"supervisor"|"guard", "phone"? }`
 | Endpoint | Method | Roles | Description |
 |----------|--------|-------|-------------|
 | `/dashboard/kpis` | GET | admin, supervisor | On-duty, incidents, SOS |
+| `/command/events` | GET | admin, supervisor | Command-center event feed (`sinceId`, `siteId`, `limit`) |
+| `/command/events/stream` | GET | admin, supervisor | Server-Sent Events stream for live command-center updates |
 | `/audit-logs` | GET | admin | Audit trail |
 | `/reports/exports` | POST | admin, supervisor | Queue job `{ "type", "params"? }` — see export types below |
 | `/reports/exports/:id` | GET | admin, supervisor | Job status, `params`, `downloadUrl`, `errorMessage` |
@@ -127,6 +129,9 @@ Body: `{ "email", "password", "role": "admin"|"supervisor"|"guard", "phone"? }`
 | `/payroll/runs` | GET | admin | List payroll runs |
 | `/payroll/runs` | POST | admin | Create draft run `{ "periodStart", "periodEnd" }` — worker processes |
 | `/payroll/runs/:runId` | GET | admin | Run detail + `lines[]` + `resultJson` totals |
+| `/payroll/runs/:runId/adjustments` | POST | admin | Add pre-processing payroll adjustment |
+| `/payroll/runs/:runId/status` | PATCH | admin | Approve or finalize completed payroll run |
+| `/payroll/runs/:runId/payslips` | GET | admin | List issued payslip payloads for finalized run |
 
 ### Export job `type` values (CSV)
 
@@ -137,6 +142,9 @@ Body: `{ "email", "password", "role": "admin"|"supervisor"|"guard", "phone"? }`
 | `attendance` | `from`, `to` (YYYY-MM-DD) | Attendance sessions overlapping range |
 | `incidents` | — | Incidents |
 | `sites` | — | Sites |
+| `staffing_utilization` | `from`, `to` | Scheduled shifts vs worked hours by guard |
+| `patrol_compliance` | `from`, `to` | Checkpoint scan coverage by site/checkpoint |
+| `payroll_variance` | — | Payroll lines with base gross, adjustments, gross, net |
 | `bacs_stub` | — | Placeholder BACS-style text (not bank-valid) |
 
 ---

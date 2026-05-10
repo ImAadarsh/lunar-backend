@@ -98,6 +98,8 @@ async function applyMigrationFile(conn, name, filename) {
         ? 'payroll_lines'
         : name === '005_leave_requests_notifications'
           ? 'leave_requests'
+        : name === '006_backend_requirements'
+          ? 'command_events'
         : null;
   if (markerTable && (await tableExists(conn, markerTable))) {
     console.log(`Table ${markerTable} exists — recording ${name} without re-run.`);
@@ -145,6 +147,7 @@ async function run() {
     await applyMigrationFile(conn, '003_payroll_export_enhancements', '003_payroll_export_enhancements.sql');
     await applyMigrationFile(conn, '004_guard_mvp_indexes', '004_guard_mvp_indexes.sql');
     await applyMigrationFile(conn, '005_leave_requests_notifications', '005_leave_requests_notifications.sql');
+    await applyMigrationFile(conn, '006_backend_requirements', '006_backend_requirements.sql');
   } finally {
     conn.release();
     await pool.end();
