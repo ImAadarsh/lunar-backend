@@ -16,7 +16,7 @@ const listQuery = z.object({
   role: z.enum(['admin', 'supervisor', 'guard']).optional(),
   status: z.enum(['active', 'invited', 'suspended']).optional(),
   page: z.coerce.number().int().min(1).optional().default(1),
-  limit: z.coerce.number().int().min(1).max(100).optional().default(20),
+  limit: z.coerce.number().int().min(1).max(500).optional().default(20),
 });
 
 const createBody = z.object({

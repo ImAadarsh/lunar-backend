@@ -23,6 +23,13 @@ set -euo pipefail
 cd "$APP_DIR"
 
 export GIT_TERMINAL_PROMPT=0
+
+# This script was originally copied to the server manually. If the repo now
+# tracks it, remove the stale untracked copy so git pull can fast-forward.
+if [ -e deploy_backend.sh ] && ! git ls-files --error-unmatch deploy_backend.sh >/dev/null 2>&1; then
+  rm -f deploy_backend.sh
+fi
+
 git pull --ff-only origin "$BRANCH"
 
 npm ci --omit=dev
