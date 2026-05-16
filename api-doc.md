@@ -51,7 +51,8 @@ Body: `{ "email", "password", "role": "admin"|"supervisor"|"guard", "phone"? }`
 |----------|--------|-------|-------------|
 | `/users` | GET | admin, supervisor | List users (query: `role`, `status`, `page`, `limit`) |
 | `/users/:id` | GET | admin, supervisor, self | Get user (`payRatePenceHour` only for admin or self) |
-| `/users` | POST | admin | Create user |
+| `/users` | POST | admin | Create user (optional `profile` for guards: `fullName`, SIA fields, etc.; `payRatePenceHour`) |
+| `/users/import` | POST | admin | Bulk create from JSON `{ "users": [ … ] }` (max 200 rows; same fields as CSV import) |
 | `/users/:id` | PATCH | admin, self (limited) | Update profile; **admin:** `payRatePenceHour` (pence/hr, nullable) |
 | `/users/:id` | DELETE | admin | Soft-disable |
 | `/users/:id/site-access` | GET | admin | Supervisor site allow-list (migration `002`) |
@@ -99,7 +100,7 @@ Body: `{ "email", "password", "role": "admin"|"supervisor"|"guard", "phone"? }`
 | `/attendance/check-out` | POST | guard | Body: `sessionId`, `lat`, `lng` |
 | `/attendance/sessions` | GET | guard, supervisor | Sessions |
 | `/telemetry/gps` | POST | guard | Batch GPS points |
-| `/patrols/scans` | POST | guard | Patrol scan + idempotency |
+| `/patrols/scans` | POST | guard | Body: `checkpointId`, `scannedAt`, `lat`, `lng`, optional `accuracyM` (≤5m), `clientMessageId` — requires open attendance session; within 5m of checkpoint |
 | `/patrols/scans` | GET | guard, supervisor | Patrol scan history (`siteId?`, `userId?`, `limit?`) |
 | `/incidents` | POST | guard | Create incident |
 | `/incidents` | GET | guard, supervisor | List (filters) |

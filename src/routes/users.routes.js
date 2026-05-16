@@ -7,8 +7,9 @@ import { ok } from '../utils/response.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireRoles } from '../middleware/rbac.js';
 import { validate } from '../middleware/validate.js';
-import { hashPassword } from '../utils/password.js';
 import { writeAudit } from '../utils/audit.js';
+import { hashPassword } from '../utils/password.js';
+import { bulkCreateUsers, createUserWithProfile } from '../services/userImportService.js';
 
 const router = Router();
 
@@ -19,12 +20,64 @@ const listQuery = z.object({
   limit: z.coerce.number().int().min(1).max(500).optional().default(20),
 });
 
-const createBody = z.object({
+const guardProfileBody = z.object({
+  fullName: z.string().min(1).optional(),
+  givenNames: z.string().optional(),
+  surname: z.string().optional(),
+  gender: z.string().optional(),
+  dateOfBirth: z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}$/)
+    .optional()
+    .nullable(),
+  siaType: z.string().optional(),
+  siaNumber: z.string().optional(),
+  siaExpiryDate: z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}$/)
+    .optional()
+    .nullable(),
+});
+
+const createBody = z
+  .object({
+    email: z.string().email(),
+    password: z.string().min(8),
+    role: z.enum(['admin', 'supervisor', 'guard']),
+    phone: z.string().optional(),
+    status: z.enum(['active', 'invited', 'suspended']).optional(),
+    payRatePenceHour: z.number().int().min(0).nullable().optional(),
+    profile: guardProfileBody.optional(),
+  })
+  .superRefine((data, ctx) => {
+    if (data.role === 'guard' && !data.profile?.fullName?.trim()) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'profile.fullName is required for guard users',
+        path: ['profile', 'fullName'],
+      });
+    }
+  });
+
+const importRowBody = z.object({
   email: z.string().email(),
   password: z.string().min(8),
   role: z.enum(['admin', 'supervisor', 'guard']),
   phone: z.string().optional(),
   status: z.enum(['active', 'invited', 'suspended']).optional(),
+  payRatePenceHour: z.union([z.number().int().min(0), z.string()]).optional().nullable(),
+  fullName: z.string().optional(),
+  givenNames: z.string().optional(),
+  surname: z.string().optional(),
+  gender: z.string().optional(),
+  dateOfBirth: z.string().optional().nullable(),
+  siaType: z.string().optional(),
+  siaNumber: z.string().optional(),
+  siaExpiryDate: z.string().optional().nullable(),
+});
+
+const bulkImportBody = z.object({
+  users: z.array(importRowBody).min(1).max(200),
 });
 
 const patchBody = z
@@ -36,6 +89,7 @@ const patchBody = z
     role: z.enum(['admin', 'supervisor', 'guard']).optional(),
     /** Gross hourly pay in pence; null clears to default */
     payRatePenceHour: z.number().int().min(0).nullable().optional(),
+    profile: guardProfileBody.partial().optional(),
   })
   .refine((o) => Object.keys(o).length > 0, { message: 'No fields to update' });
 
@@ -67,7 +121,9 @@ router.get(
     const total = Number(countRows[0]?.total ?? 0);
     const [rows] = await pool.query(
       `SELECT u.id, u.email, u.phone, u.status, r.slug AS role, u.created_at,
-              gp.full_name AS fullName, gp.sia_number AS siaNumber, gp.sia_expiry_date AS siaExpiryDate
+              u.pay_rate_pence_hour AS payRatePenceHour,
+              gp.full_name AS fullName, gp.sia_type AS siaType,
+              gp.sia_number AS siaNumber, gp.sia_expiry_date AS siaExpiryDate
        FROM users u
        JOIN roles r ON r.id = u.role_id
        LEFT JOIN guard_profiles gp ON gp.user_id = u.id
@@ -183,28 +239,50 @@ router.post(
   requireRoles('admin'),
   validate(createBody),
   asyncHandler(async (req, res) => {
-    const { email, password, role, phone, status } = req.validated.body;
-    const pool = getPool();
-    const [[roleRow]] = await pool.query(`SELECT id FROM roles WHERE slug = ?`, [role]);
-    if (!roleRow) throw new AppError(400, 'VALIDATION_ERROR', 'Invalid role');
-    const password_hash = await hashPassword(password);
-    try {
-      const [r] = await pool.query(
-        `INSERT INTO users (email, phone, password_hash, role_id, status) VALUES (?, ?, ?, ?, ?)`,
-        [email, phone ?? null, password_hash, roleRow.id, status ?? 'active']
-      );
-      await writeAudit({
-        userId: req.auth.userId,
-        action: 'user.create',
-        entityType: 'user',
-        entityId: r.insertId,
-        ip: req.ip,
-      });
-      return ok(res, { id: r.insertId }, 201);
-    } catch (e) {
-      if (e.code === 'ER_DUP_ENTRY') throw new AppError(409, 'CONFLICT', 'Email exists');
-      throw e;
-    }
+    const body = req.validated.body;
+    const created = await createUserWithProfile(
+      {
+        email: body.email,
+        password: body.password,
+        role: body.role,
+        phone: body.phone,
+        status: body.status ?? 'active',
+        payRatePenceHour: body.payRatePenceHour ?? null,
+        profile: body.profile,
+        importSource: 'admin_portal',
+      },
+      req.auth.userId,
+      req.ip
+    );
+    return ok(res, created, 201);
+  })
+);
+
+router.post(
+  '/import',
+  requireRoles('admin'),
+  validate(bulkImportBody),
+  asyncHandler(async (req, res) => {
+    const { users } = req.validated.body;
+    const result = await bulkCreateUsers(
+      users.map((u) => ({
+        ...u,
+        profile: {
+          fullName: u.fullName,
+          givenNames: u.givenNames,
+          surname: u.surname,
+          gender: u.gender,
+          dateOfBirth: u.dateOfBirth,
+          siaType: u.siaType,
+          siaNumber: u.siaNumber,
+          siaExpiryDate: u.siaExpiryDate,
+        },
+        importSource: 'admin_csv_import',
+      })),
+      req.auth.userId,
+      req.ip
+    );
+    return ok(res, result, result.failed.length && !result.created.length ? 422 : 201);
   })
 );
 
@@ -250,10 +328,65 @@ router.patch(
       fields.push('pay_rate_pence_hour = ?');
       params.push(body.payRatePenceHour);
     }
-    if (!fields.length) throw new AppError(400, 'VALIDATION_ERROR', 'No updates');
-    params.push(id);
-    const [r] = await pool.query(`UPDATE users SET ${fields.join(', ')} WHERE id = ?`, params);
-    if (r.affectedRows === 0) throw new AppError(404, 'NOT_FOUND', 'User not found');
+    const profile = body.profile;
+    let targetRole = null;
+    if (profile && Object.values(profile).some((v) => v !== undefined && v !== null && v !== '')) {
+      const [[roleRow]] = await pool.query(
+        `SELECT r.slug FROM users u JOIN roles r ON r.id = u.role_id WHERE u.id = ?`,
+        [id]
+      );
+      targetRole = roleRow?.slug ?? null;
+    }
+    const canUpdateProfile = isAdmin || (isSelf && targetRole === 'guard');
+    const hasProfile =
+      profile &&
+      canUpdateProfile &&
+      Object.values(profile).some((v) => v !== undefined && v !== null && v !== '');
+
+    if (!fields.length && !hasProfile) throw new AppError(400, 'VALIDATION_ERROR', 'No updates');
+
+    if (fields.length) {
+      params.push(id);
+      const [r] = await pool.query(`UPDATE users SET ${fields.join(', ')} WHERE id = ?`, params);
+      if (r.affectedRows === 0) throw new AppError(404, 'NOT_FOUND', 'User not found');
+    } else {
+      const [[exists]] = await pool.query(`SELECT id FROM users WHERE id = ?`, [id]);
+      if (!exists) throw new AppError(404, 'NOT_FOUND', 'User not found');
+    }
+
+    if (hasProfile) {
+      if (targetRole !== 'guard') {
+        throw new AppError(400, 'VALIDATION_ERROR', 'Profile updates apply to guard users only');
+      }
+      const fullName = profile.fullName?.trim();
+      if (!fullName) throw new AppError(400, 'VALIDATION_ERROR', 'profile.fullName is required');
+      await pool.query(
+        `INSERT INTO guard_profiles
+          (user_id, full_name, given_names, surname, gender, date_of_birth, sia_type, sia_number, sia_expiry_date)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+           full_name = VALUES(full_name),
+           given_names = VALUES(given_names),
+           surname = VALUES(surname),
+           gender = VALUES(gender),
+           date_of_birth = VALUES(date_of_birth),
+           sia_type = VALUES(sia_type),
+           sia_number = VALUES(sia_number),
+           sia_expiry_date = VALUES(sia_expiry_date)`,
+        [
+          id,
+          fullName,
+          profile.givenNames?.trim() || null,
+          profile.surname?.trim() || null,
+          profile.gender?.trim() || null,
+          profile.dateOfBirth || null,
+          profile.siaType?.trim() || null,
+          profile.siaNumber?.trim() || null,
+          profile.siaExpiryDate || null,
+        ]
+      );
+    }
+
     await writeAudit({
       userId: req.auth.userId,
       action: 'user.update',

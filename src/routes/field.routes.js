@@ -12,7 +12,7 @@ import { ok } from '../utils/response.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireRoles } from '../middleware/rbac.js';
 import { validate } from '../middleware/validate.js';
-import { isInsideGeofence } from '../utils/geo.js';
+import { isInsideGeofence, validateCheckpointScanLocation } from '../utils/geo.js';
 import { writeAudit } from '../utils/audit.js';
 import { publishCommandEvent } from '../services/commandEventService.js';
 import { processUploadedMedia } from '../services/mediaProcessingService.js';
@@ -49,6 +49,9 @@ const gpsBody = z.object({
 const patrolBody = z.object({
   checkpointId: z.number().int(),
   scannedAt: z.string(),
+  lat: z.number(),
+  lng: z.number(),
+  accuracyM: z.number().min(0).max(100).optional(),
   clientMessageId: z.string().max(64).optional(),
 });
 
@@ -163,7 +166,11 @@ router.post(
       throw new AppError(404, 'NOT_FOUND', 'Shift not found');
     }
     if (!isInsideGeofence(shift, lat, lng)) {
-      throw new AppError(400, 'VALIDATION_ERROR', 'Outside geofence');
+      throw new AppError(
+        400,
+        'VALIDATION_ERROR',
+        'You must be at the site to check in. Move inside the site geofence and try again.'
+      );
     }
     const [open] = await pool.query(
       `SELECT id FROM attendance_sessions WHERE user_id = ? AND shift_id = ? AND status = 'open'`,
@@ -331,14 +338,29 @@ router.post(
     requireRoles('guard'),
   validate(patrolBody),
   asyncHandler(async (req, res) => {
-    const { checkpointId, scannedAt, clientMessageId } = req.validated.body;
+    const { checkpointId, scannedAt, lat, lng, accuracyM, clientMessageId } = req.validated.body;
     const pool = getPool();
+    const [openSession] = await pool.query(
+      `SELECT id FROM attendance_sessions WHERE user_id = ? AND status = 'open' LIMIT 1`,
+      [req.auth.userId]
+    );
+    if (!openSession[0]) {
+      throw new AppError(
+        400,
+        'VALIDATION_ERROR',
+        'Check in to your shift before scanning checkpoints.'
+      );
+    }
     const [checkpointRows] = await pool.query(
-      `SELECT id, site_id AS siteId, label FROM checkpoints WHERE id = ?`,
+      `SELECT id, site_id AS siteId, label, lat, lng FROM checkpoints WHERE id = ?`,
       [checkpointId]
     );
     if (!checkpointRows[0]) throw new AppError(400, 'VALIDATION_ERROR', 'Invalid checkpointId');
     const checkpoint = checkpointRows[0];
+    const locationCheck = validateCheckpointScanLocation(checkpoint, lat, lng, accuracyM);
+    if (!locationCheck.ok) {
+      throw new AppError(400, 'VALIDATION_ERROR', locationCheck.message);
+    }
     if (clientMessageId) {
       const [ex] = await pool.query(`SELECT id FROM patrol_scans WHERE client_message_id = ?`, [
         clientMessageId,
@@ -356,7 +378,15 @@ router.post(
         action: 'patrol.scan',
         entityType: 'patrol_scan',
         entityId: r.insertId,
-        payload: { checkpointId, siteId: checkpoint.siteId, clientMessageId: clientMessageId ?? null },
+        payload: {
+          checkpointId,
+          siteId: checkpoint.siteId,
+          lat,
+          lng,
+          accuracyM: accuracyM ?? null,
+          distanceM: locationCheck.distanceM,
+          clientMessageId: clientMessageId ?? null,
+        },
         ip: req.ip,
       });
       await publishCommandEvent({

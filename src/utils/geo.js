@@ -63,3 +63,38 @@ export function isInsideGeofence(site, lat, lng) {
   if (site.geofence_polygon) return isInsidePolygon(site.geofence_polygon, lat, lng);
   return isInsideCircularGeofence(site, lat, lng);
 }
+
+/** Max horizontal distance from checkpoint center to accept a patrol scan (meters). */
+export const CHECKPOINT_SCAN_RADIUS_M = 5;
+
+/** Reject scans when reported GPS accuracy is worse than this (meters). */
+export const MAX_PATROL_GPS_ACCURACY_M = 5;
+
+/**
+ * Guard must be within CHECKPOINT_SCAN_RADIUS_M of the checkpoint and report
+ * accuracy no worse than MAX_PATROL_GPS_ACCURACY_M when accuracy is provided.
+ */
+export function validateCheckpointScanLocation(checkpoint, lat, lng, accuracyM) {
+  const cpLat = Number(checkpoint.lat);
+  const cpLng = Number(checkpoint.lng);
+  if (!Number.isFinite(cpLat) || !Number.isFinite(cpLng)) {
+    return { ok: false, message: 'Checkpoint has no GPS coordinates configured' };
+  }
+  if (accuracyM != null && Number.isFinite(Number(accuracyM))) {
+    const acc = Number(accuracyM);
+    if (acc > MAX_PATROL_GPS_ACCURACY_M) {
+      return {
+        ok: false,
+        message: `GPS accuracy too low (${Math.round(acc)}m). Move closer and wait for a stronger signal (need ≤${MAX_PATROL_GPS_ACCURACY_M}m).`,
+      };
+    }
+  }
+  const distance = distanceMeters(lat, lng, cpLat, cpLng);
+  if (distance > CHECKPOINT_SCAN_RADIUS_M) {
+    return {
+      ok: false,
+      message: `You must be within ${CHECKPOINT_SCAN_RADIUS_M}m of the checkpoint (${Math.round(distance)}m away).`,
+    };
+  }
+  return { ok: true, distanceM: distance };
+}
