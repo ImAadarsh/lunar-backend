@@ -6,6 +6,8 @@ import checkpointsRoutes from './checkpoints.routes.js';
 import shiftsRoutes from './shifts.routes.js';
 import fieldRoutes from './field.routes.js';
 import opsRoutes from './ops.routes.js';
+import dashboardRoutes from './dashboard.routes.js';
+import dutyRoutes from './duty.routes.js';
 import engagementRoutes from './engagement.routes.js';
 
 const api = Router();
@@ -17,6 +19,8 @@ api.use('/checkpoints', checkpointsRoutes);
 api.use('/', shiftsRoutes);
 api.use('/', fieldRoutes);
 api.use('/', opsRoutes);
+api.use('/', dashboardRoutes);
+api.use('/', dutyRoutes);
 api.use('/', engagementRoutes);
 
 export default api;

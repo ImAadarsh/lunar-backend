@@ -10,6 +10,13 @@ import { validate } from '../middleware/validate.js';
 import { writeAudit } from '../utils/audit.js';
 import { createNotification } from '../services/notificationService.js';
 import { publishCommandEvent } from '../services/commandEventService.js';
+import {
+  canAssignFromAvailability,
+  enrichShiftsWithDutyState,
+  ensureGuardTrainedForSite,
+  evaluateGuardDutyForUser,
+  autoMarkMissedShifts,
+} from '../services/guardDutyService.js';
 
 const router = Router();
 const templates = Router();
@@ -30,14 +37,14 @@ const shiftBody = z.object({
   templateId: z.number().int().nullable().optional(),
   startsAt: z.string().min(1),
   endsAt: z.string().min(1),
-  status: z.enum(['scheduled', 'active', 'completed', 'cancelled']).optional(),
+  status: z.enum(['scheduled', 'active', 'completed', 'cancelled', 'missed']).optional(),
 });
 
 const shiftPatch = z
   .object({
     startsAt: z.string().min(1).optional(),
     endsAt: z.string().min(1).optional(),
-    status: z.enum(['scheduled', 'active', 'completed', 'cancelled']).optional(),
+    status: z.enum(['scheduled', 'active', 'completed', 'cancelled', 'missed']).optional(),
     siteId: z.number().int().optional(),
     userId: z.number().int().optional(),
   })
@@ -48,7 +55,7 @@ const shiftListQuery = z.object({
   siteId: z.coerce.number().int().optional(),
   from: z.string().optional(),
   to: z.string().optional(),
-  status: z.enum(['scheduled', 'active', 'completed', 'cancelled']).optional(),
+  status: z.enum(['scheduled', 'active', 'completed', 'cancelled', 'missed']).optional(),
 });
 
 const swapBody = z.object({
@@ -202,13 +209,23 @@ router.get(
       params.push(q.to);
     }
     const sqlWhere = where.length ? `WHERE ${where.join(' AND ')}` : '';
+    await autoMarkMissedShifts(pool, {
+      userId: q.userId ?? (req.auth.role === 'guard' ? req.auth.userId : undefined),
+      siteId: q.siteId,
+    });
     const [rows] = await pool.query(
       `SELECT s.id, s.site_id AS siteId, s.user_id AS userId, s.template_id AS templateId,
-              s.starts_at AS startsAt, s.ends_at AS endsAt, s.status, s.created_at AS createdAt
-       FROM shifts s ${sqlWhere} ORDER BY s.starts_at DESC LIMIT 500`,
+              s.starts_at AS startsAt, s.ends_at AS endsAt, s.status, s.created_at AS createdAt,
+              st.name AS siteName, u.email AS userEmail, u.phone AS userPhone, gp.full_name AS guardName
+       FROM shifts s
+       JOIN sites st ON st.id = s.site_id
+       JOIN users u ON u.id = s.user_id
+       LEFT JOIN guard_profiles gp ON gp.user_id = u.id
+       ${sqlWhere} ORDER BY s.starts_at DESC LIMIT 500`,
       params
     );
-    return ok(res, { items: rows });
+    const items = await enrichShiftsWithDutyState(pool, rows);
+    return ok(res, { items });
   })
   )
 );
@@ -221,6 +238,15 @@ router.post(
   asyncHandler(async (req, res) => {
     const b = req.validated.body;
     const pool = getPool();
+    await ensureGuardTrainedForSite(pool, b.userId, b.siteId);
+    const duty = await evaluateGuardDutyForUser(pool, b.userId);
+    if (!canAssignFromAvailability(duty)) {
+      throw new AppError(
+        400,
+        'VALIDATION_ERROR',
+        `Guard cannot be assigned (${duty.state.replace(/_/g, ' ')})`
+      );
+    }
     const [r] = await pool.query(
       `INSERT INTO shifts (site_id, user_id, template_id, starts_at, ends_at, status)
        VALUES (?, ?, ?, ?, ?, ?)`,
@@ -293,6 +319,25 @@ router.patch(
       fields.push('user_id = ?');
       params.push(b.userId);
     }
+    const [existingRows] = await pool.query(
+      `SELECT user_id AS userId, site_id AS siteId FROM shifts WHERE id = ?`,
+      [id]
+    );
+    const existing = existingRows[0];
+    if (!existing) throw new AppError(404, 'NOT_FOUND', 'Shift not found');
+    const nextUserId = b.userId ?? existing.userId;
+    const nextSiteId = b.siteId ?? existing.siteId;
+    await ensureGuardTrainedForSite(pool, nextUserId, nextSiteId);
+    if (b.userId !== undefined && Number(b.userId) !== Number(existing.userId)) {
+      const duty = await evaluateGuardDutyForUser(pool, nextUserId);
+      if (!canAssignFromAvailability(duty)) {
+        throw new AppError(
+          400,
+          'VALIDATION_ERROR',
+          `Guard cannot be assigned (${duty.state.replace(/_/g, ' ')})`
+        );
+      }
+    }
     params.push(id);
     const [r] = await pool.query(`UPDATE shifts SET ${fields.join(', ')} WHERE id = ?`, params);
     if (r.affectedRows === 0) throw new AppError(404, 'NOT_FOUND', 'Shift not found');
@@ -330,6 +375,62 @@ router.patch(
     });
     return ok(res, { updated: true });
   })
+  )
+);
+
+router.delete(
+  '/shifts/:id',
+  ...withAuth(
+    requireRoles('admin', 'supervisor'),
+    asyncHandler(async (req, res) => {
+      const id = Number(req.params.id);
+      const pool = getPool();
+      const [[shift]] = await pool.query(
+        `SELECT id, user_id AS userId, site_id AS siteId, starts_at AS startsAt, ends_at AS endsAt, status
+         FROM shifts WHERE id = ?`,
+        [id]
+      );
+      if (!shift) throw new AppError(404, 'NOT_FOUND', 'Shift not found');
+
+      const [[att]] = await pool.query(
+        `SELECT id FROM attendance_sessions WHERE shift_id = ? LIMIT 1`,
+        [id]
+      );
+      if (att) {
+        throw new AppError(
+          409,
+          'CONFLICT',
+          'Cannot delete a shift with attendance records. Cancel the shift instead.'
+        );
+      }
+
+      await pool.query(`DELETE FROM shifts WHERE id = ?`, [id]);
+
+      await writeAudit({
+        userId: req.auth.userId,
+        action: 'shift.delete',
+        entityType: 'shift',
+        entityId: id,
+        payload: {
+          userId: shift.userId,
+          siteId: shift.siteId,
+          startsAt: shift.startsAt,
+          endsAt: shift.endsAt,
+          status: shift.status,
+        },
+        ip: req.ip,
+      });
+      await publishCommandEvent({
+        type: 'shift.deleted',
+        actorUserId: req.auth.userId,
+        subjectUserId: Number(shift.userId),
+        siteId: Number(shift.siteId),
+        entityType: 'shift',
+        entityId: id,
+        payload: { status: shift.status },
+      });
+      return ok(res, { deleted: true });
+    })
   )
 );
 

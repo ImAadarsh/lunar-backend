@@ -3,7 +3,6 @@ SET NAMES utf8mb4;
 SET FOREIGN_KEY_CHECKS = 0;
 DROP TABLE IF EXISTS export_jobs;
 DROP TABLE IF EXISTS payroll_runs;
-DROP TABLE IF EXISTS employee_certifications;
 DROP TABLE IF EXISTS incident_attachments;
 DROP TABLE IF EXISTS incidents;
 DROP TABLE IF EXISTS patrol_scans;
@@ -257,19 +256,6 @@ CREATE TABLE sos_events (
   KEY idx_sos_status (status, created_at),
   KEY idx_sos_user (user_id),
   CONSTRAINT fk_sos_user FOREIGN KEY (user_id) REFERENCES users (id)
-    ON DELETE CASCADE ON UPDATE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
-CREATE TABLE employee_certifications (
-  id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-  user_id INT UNSIGNED NOT NULL,
-  name VARCHAR(255) NOT NULL,
-  issuer VARCHAR(255) DEFAULT NULL,
-  obtained_on DATE DEFAULT NULL,
-  expires_on DATE DEFAULT NULL,
-  KEY idx_cert_user (user_id),
-  KEY idx_cert_expires (expires_on),
-  CONSTRAINT fk_cert_user FOREIGN KEY (user_id) REFERENCES users (id)
     ON DELETE CASCADE ON UPDATE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 

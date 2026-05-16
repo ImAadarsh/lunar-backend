@@ -249,7 +249,7 @@ router.post(
 router.get(
   '/attendance/sessions',
   ...withAuth(
-    requireRoles('guard', 'supervisor'),
+    requireRoles('guard', 'supervisor', 'admin'),
   asyncHandler(async (req, res) => {
     const pool = getPool();
     const targetUser = req.query.userId ? Number(req.query.userId) : req.auth.userId;
@@ -652,7 +652,7 @@ router.post(
 router.get(
   '/incidents',
   ...withAuth(
-    requireRoles('guard', 'supervisor'),
+    requireRoles('guard', 'supervisor', 'admin'),
     validate(incidentsListQuery, 'query'),
   asyncHandler(async (req, res) => {
     const { siteId, status, userId, q, page, limit } = req.validated.query;
@@ -661,42 +661,52 @@ router.get(
     const where = [];
     const params = [];
     if (req.auth.role === 'guard') {
-      where.push('user_id = ?');
+      where.push('i.user_id = ?');
       params.push(req.auth.userId);
     } else if (userId) {
-      where.push('user_id = ?');
+      where.push('i.user_id = ?');
       params.push(userId);
     }
     if (siteId) {
-      where.push('site_id = ?');
+      where.push('i.site_id = ?');
       params.push(siteId);
     }
     if (status) {
-      where.push('status = ?');
+      where.push('i.status = ?');
       params.push(status);
     }
     if (q) {
       where.push(`(
-        title LIKE ?
-        OR category LIKE ?
-        OR COALESCE(description, '') LIKE ?
-        OR CAST(site_id AS CHAR) LIKE ?
-        OR CAST(user_id AS CHAR) LIKE ?
+        i.title LIKE ?
+        OR i.category LIKE ?
+        OR COALESCE(i.description, '') LIKE ?
+        OR CAST(i.site_id AS CHAR) LIKE ?
+        OR CAST(i.user_id AS CHAR) LIKE ?
+        OR st.name LIKE ?
+        OR u.email LIKE ?
+        OR gp.full_name LIKE ?
       )`);
       const like = `%${q}%`;
-      params.push(like, like, like, like, like);
+      params.push(like, like, like, like, like, like, like, like);
     }
     const sqlWhere = where.length ? `WHERE ${where.join(' AND ')}` : '';
+    const fromJoin = `FROM incidents i
+       JOIN users u ON u.id = i.user_id
+       LEFT JOIN guard_profiles gp ON gp.user_id = u.id
+       JOIN sites st ON st.id = i.site_id`;
     const [countRows] = await pool.query(
-      `SELECT COUNT(*) AS total FROM incidents ${sqlWhere}`,
+      `SELECT COUNT(*) AS total ${fromJoin} ${sqlWhere}`,
       params
     );
     const total = Number(countRows[0]?.total ?? 0);
     const [rows] = await pool.query(
-      `SELECT id, user_id AS userId, site_id AS siteId, shift_id AS shiftId,
-              attendance_session_id AS attendanceSessionId, category, title, status,
-              lat, lng, captured_at AS capturedAt, created_at AS createdAt
-       FROM incidents ${sqlWhere} ORDER BY id DESC LIMIT ? OFFSET ?`,
+      `SELECT i.id, i.user_id AS userId, i.site_id AS siteId, i.shift_id AS shiftId,
+              i.attendance_session_id AS attendanceSessionId, i.category, i.title, i.status,
+              i.lat, i.lng, i.captured_at AS capturedAt, i.created_at AS createdAt,
+              st.name AS siteName, u.email AS userEmail, u.phone AS userPhone, gp.full_name AS guardName
+       ${fromJoin}
+       ${sqlWhere}
+       ORDER BY i.id DESC LIMIT ? OFFSET ?`,
       [...params, limit, offset]
     );
     return ok(res, { items: rows, page, limit, total });
@@ -883,8 +893,13 @@ router.get(
   asyncHandler(async (_req, res) => {
     const pool = getPool();
     const [rows] = await pool.query(
-      `SELECT id, user_id AS userId, lat, lng, message, status, created_at AS createdAt, resolved_at AS resolvedAt
-       FROM sos_events ORDER BY id DESC LIMIT 100`
+      `SELECT se.id, se.user_id AS userId, se.lat, se.lng, se.message, se.status,
+              se.created_at AS createdAt, se.resolved_at AS resolvedAt,
+              u.email AS userEmail, u.phone AS userPhone, gp.full_name AS guardName
+       FROM sos_events se
+       JOIN users u ON u.id = se.user_id
+       LEFT JOIN guard_profiles gp ON gp.user_id = u.id
+       ORDER BY se.id DESC LIMIT 100`
     );
     return ok(res, { items: rows });
   })

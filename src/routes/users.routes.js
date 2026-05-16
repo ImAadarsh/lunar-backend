@@ -66,8 +66,11 @@ router.get(
     );
     const total = Number(countRows[0]?.total ?? 0);
     const [rows] = await pool.query(
-      `SELECT u.id, u.email, u.phone, u.status, r.slug AS role, u.created_at
-       FROM users u JOIN roles r ON r.id = u.role_id
+      `SELECT u.id, u.email, u.phone, u.status, r.slug AS role, u.created_at,
+              gp.full_name AS fullName, gp.sia_number AS siaNumber, gp.sia_expiry_date AS siaExpiryDate
+       FROM users u
+       JOIN roles r ON r.id = u.role_id
+       LEFT JOIN guard_profiles gp ON gp.user_id = u.id
        ${sqlWhere}
        ORDER BY u.id DESC LIMIT ? OFFSET ?`,
       [...params, limit, offset]
@@ -156,8 +159,14 @@ router.get(
     if (!allowed) throw new AppError(403, 'FORBIDDEN', 'Cannot view this user');
     const [rows] = await pool.query(
       `SELECT u.id, u.email, u.phone, u.status, r.slug AS role, u.created_at,
-              u.two_factor_enabled AS twoFactorEnabled, u.pay_rate_pence_hour AS payRatePenceHour
-       FROM users u JOIN roles r ON r.id = u.role_id WHERE u.id = ?`,
+              u.two_factor_enabled AS twoFactorEnabled, u.pay_rate_pence_hour AS payRatePenceHour,
+              gp.full_name AS fullName, gp.given_names AS givenNames, gp.surname,
+              gp.gender, gp.date_of_birth AS dateOfBirth,
+              gp.sia_type AS siaType, gp.sia_number AS siaNumber, gp.sia_expiry_date AS siaExpiryDate
+       FROM users u
+       JOIN roles r ON r.id = u.role_id
+       LEFT JOIN guard_profiles gp ON gp.user_id = u.id
+       WHERE u.id = ?`,
       [id]
     );
     if (!rows[0]) throw new AppError(404, 'NOT_FOUND', 'User not found');

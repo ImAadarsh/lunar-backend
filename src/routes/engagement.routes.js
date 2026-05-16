@@ -86,9 +86,16 @@ router.get(
       `SELECT lr.id, lr.user_id AS userId, lr.leave_type AS leaveType, lr.start_date AS startDate,
               lr.end_date AS endDate, lr.reason, lr.status, lr.requested_at AS requestedAt,
               lr.decided_at AS decidedAt, lr.decided_by AS decidedBy, lr.manager_comment AS managerComment,
-              u.email AS userEmail
+              u.email AS userEmail, u.phone AS userPhone, u.status AS userStatus,
+              r.slug AS userRole,
+              gp.full_name AS guardName, gp.given_names AS guardGivenNames, gp.surname AS guardSurname,
+              gp.gender AS guardGender, gp.date_of_birth AS guardDateOfBirth,
+              gp.sia_type AS guardSiaType, gp.sia_number AS guardSiaNumber,
+              gp.sia_expiry_date AS guardSiaExpiryDate
        FROM leave_requests lr
        JOIN users u ON u.id = lr.user_id
+       JOIN roles r ON r.id = u.role_id
+       LEFT JOIN guard_profiles gp ON gp.user_id = u.id
        ${sqlWhere}
        ORDER BY lr.requested_at DESC
        LIMIT ?`,

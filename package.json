@@ -11,7 +11,9 @@
     "worker": "node src/workers/jobWorker.js",
     "test": "vitest run",
     "test:watch": "vitest",
-    "seed:demo": "node scripts/seedDemoUsers.js"
+    "seed:demo": "node scripts/seedDemoUsers.js",
+    "seed:guards": "node scripts/importGuardsFromExcel.js",
+    "seed:sites": "node scripts/resetSites.js"
   },
   "engines": {
     "node": ">=18"

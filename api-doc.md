@@ -149,14 +149,14 @@ Body: `{ "email", "password", "role": "admin"|"supervisor"|"guard", "phone"? }`
 
 ---
 
-## Compliance
+## Training (guard ↔ site)
 
 | Endpoint | Method | Roles | Description |
 |----------|--------|-------|-------------|
-| `/certifications` | GET | admin, supervisor | List (filter `userId`, `expiringBefore`) |
-| `/certifications` | POST | admin | Assign certification |
-| `/certifications/:id` | PATCH | admin | Update / renew |
-| `/certifications/:id` | DELETE | admin | Remove |
+| `/training/assignments` | GET | admin, supervisor | List guard–site training rows (filter `siteId`, `userId`) |
+| `/training/assignments` | POST | admin | Assign a guard to a site |
+| `/training/assignments/bulk` | POST | admin | Assign many guards to many sites (`userIds[]`, `siteIds[]`; skips duplicates) |
+| `/training/assignments/:id` | DELETE | admin | Remove assignment |
 
 ---
 

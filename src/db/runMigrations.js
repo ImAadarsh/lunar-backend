@@ -102,6 +102,10 @@ async function applyMigrationFile(conn, name, filename) {
           ? 'command_events'
         : name === '007_remaining_features'
           ? 'patrol_routes'
+        : name === '008_guard_site_training'
+          ? 'guard_site_training'
+        : name === '009_guard_profiles'
+          ? 'guard_profiles'
         : null;
   if (markerTable && (await tableExists(conn, markerTable))) {
     console.log(`Table ${markerTable} exists — recording ${name} without re-run.`);
@@ -151,6 +155,9 @@ async function run() {
     await applyMigrationFile(conn, '005_leave_requests_notifications', '005_leave_requests_notifications.sql');
     await applyMigrationFile(conn, '006_backend_requirements', '006_backend_requirements.sql');
     await applyMigrationFile(conn, '007_remaining_features', '007_remaining_features.sql');
+    await applyMigrationFile(conn, '008_guard_site_training', '008_guard_site_training.sql');
+    await applyMigrationFile(conn, '009_guard_profiles', '009_guard_profiles.sql');
+    await applyMigrationFile(conn, '010_drop_site_assets', '010_drop_site_assets.sql');
   } finally {
     conn.release();
     await pool.end();

@@ -34,14 +34,6 @@ const cpBody = z.object({
 });
 
 const cpPatch = cpBody.partial();
-const assetBody = z.object({
-  name: z.string().min(1),
-  assetType: z.string().min(1),
-  status: z.enum(['active', 'maintenance', 'retired']).optional(),
-  lat: z.number().optional(),
-  lng: z.number().optional(),
-  notes: z.string().optional(),
-});
 
 const siteListQuery = z.object({
   page: z.coerce.number().int().min(1).optional().default(1),
@@ -288,56 +280,5 @@ cpRouter.post(
 );
 
 router.use('/:siteId/checkpoints', cpRouter);
-
-const assetRouter = Router({ mergeParams: true });
-
-assetRouter.get(
-  '/',
-  asyncHandler(async (req, res) => {
-    const siteId = Number(req.params.siteId);
-    if (req.auth.role === 'supervisor') {
-      const okAccess = await supervisorCanAccessSite(req.auth.userId, req.auth.role, siteId);
-      if (!okAccess) throw new AppError(403, 'FORBIDDEN', 'No access to this site');
-    }
-    const pool = getPool();
-    const [rows] = await pool.query(
-      `SELECT id, site_id AS siteId, name, asset_type AS assetType, status, lat, lng, notes, created_at AS createdAt
-       FROM site_assets WHERE site_id = ? ORDER BY status, name`,
-      [siteId]
-    );
-    return ok(res, { items: rows });
-  })
-);
-
-assetRouter.post(
-  '/',
-  requireRoles('admin', 'supervisor'),
-  validate(assetBody),
-  asyncHandler(async (req, res) => {
-    const siteId = Number(req.params.siteId);
-    if (req.auth.role === 'supervisor') {
-      const okAccess = await supervisorCanAccessSite(req.auth.userId, req.auth.role, siteId);
-      if (!okAccess) throw new AppError(403, 'FORBIDDEN', 'No access to this site');
-    }
-    const b = req.validated.body;
-    const pool = getPool();
-    const [r] = await pool.query(
-      `INSERT INTO site_assets (site_id, name, asset_type, status, lat, lng, notes)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [siteId, b.name, b.assetType, b.status ?? 'active', b.lat ?? null, b.lng ?? null, b.notes ?? null]
-    );
-    await writeAudit({
-      userId: req.auth.userId,
-      action: 'site_asset.create',
-      entityType: 'site_asset',
-      entityId: r.insertId,
-      payload: { siteId, assetType: b.assetType },
-      ip: req.ip,
-    });
-    return ok(res, { id: r.insertId }, 201);
-  })
-);
-
-router.use('/:siteId/assets', assetRouter);
 
 export default router;

@@ -13,6 +13,7 @@ import { env } from '../config/env.js';
 import { listCommandEvents, publishCommandEvent } from '../services/commandEventService.js';
 import { writeAudit } from '../utils/audit.js';
 import { ensurePayslipPdf } from '../services/payslipService.js';
+import { supervisorAllowedSiteIds } from '../utils/siteAccess.js';
 
 const router = Router();
 
@@ -36,15 +37,29 @@ const payrollStatusBody = z.object({
   status: z.enum(['approved', 'finalized']),
 });
 
-const certBody = z.object({
+const trainingDateField = z
+  .string()
+  .regex(/^\d{4}-\d{2}-\d{2}$/)
+  .optional();
+
+const trainingAssignmentBody = z.object({
   userId: z.number().int(),
-  name: z.string().min(1),
-  issuer: z.string().optional(),
-  obtainedOn: z.string().optional(),
-  expiresOn: z.string().optional(),
+  siteId: z.number().int(),
+  trainedOn: trainingDateField,
+  notes: z.string().max(512).optional(),
 });
 
-const certPatch = certBody.partial().omit({ userId: true });
+const trainingBulkAssignmentBody = z.object({
+  userIds: z.array(z.number().int()).min(1).max(200),
+  siteIds: z.array(z.number().int()).min(1).max(200),
+  trainedOn: trainingDateField,
+  notes: z.string().max(512).optional(),
+});
+
+const trainingListQuery = z.object({
+  siteId: z.coerce.number().int().optional(),
+  userId: z.coerce.number().int().optional(),
+});
 const commandEventsQuery = z.object({
   sinceId: z.coerce.number().int().min(0).optional().default(0),
   limit: z.coerce.number().int().min(1).max(500).optional().default(100),
@@ -75,28 +90,6 @@ const lifecycleBody = z.object({
   notes: z.string().optional(),
   effectiveOn: z.string().optional(),
 });
-const trainingRequirementBody = z.object({
-  name: z.string().min(1),
-  description: z.string().optional(),
-  roleSlug: z.string().optional(),
-  renewalMonths: z.number().int().positive().optional(),
-  isActive: z.boolean().optional(),
-});
-const trainingCompletionBody = z.object({
-  userId: z.number().int(),
-  completedOn: z.string(),
-  expiresOn: z.string().optional(),
-  evidenceMediaId: z.number().int().optional(),
-});
-const siteAssetBody = z.object({
-  name: z.string().min(1),
-  assetType: z.string().min(1),
-  status: z.enum(['active', 'maintenance', 'retired']).optional(),
-  lat: z.number().optional(),
-  lng: z.number().optional(),
-  notes: z.string().optional(),
-});
-
 const withAuth = (...m) => [requireAuth, ...m];
 
 router.get(
@@ -338,16 +331,61 @@ router.post(
   )
 );
 
+async function ensureGuardUser(pool, userId) {
+  const [rows] = await pool.query(
+    `SELECT u.id
+     FROM users u
+     JOIN roles r ON r.id = u.role_id
+     WHERE u.id = ? AND r.slug = 'guard'`,
+    [userId]
+  );
+  if (!rows.length) {
+    throw new AppError(400, 'VALIDATION_ERROR', 'User must be a guard (staff)');
+  }
+}
+
 router.get(
-  '/training/requirements',
+  '/training/assignments',
   ...withAuth(
     requireRoles('admin', 'supervisor'),
-    asyncHandler(async (_req, res) => {
+    validate(trainingListQuery, 'query'),
+    asyncHandler(async (req, res) => {
+      const q = req.validated.query;
       const pool = getPool();
+      const allowed = await supervisorAllowedSiteIds(req.auth.userId, req.auth.role);
+      const where = [`r.slug = 'guard'`];
+      const params = [];
+      if (q.siteId) {
+        where.push('gst.site_id = ?');
+        params.push(q.siteId);
+      }
+      if (q.userId) {
+        where.push('gst.user_id = ?');
+        params.push(q.userId);
+      }
+      if (allowed && allowed.length > 0) {
+        where.push(`gst.site_id IN (${allowed.map(() => '?').join(',')})`);
+        params.push(...allowed);
+      }
       const [rows] = await pool.query(
-        `SELECT id, name, description, role_slug AS roleSlug, renewal_months AS renewalMonths,
-                is_active AS isActive, created_at AS createdAt
-         FROM training_requirements ORDER BY is_active DESC, name`
+        `SELECT gst.id,
+                gst.user_id AS userId,
+                u.email AS userEmail,
+                gp.full_name AS guardName,
+                gst.site_id AS siteId,
+                s.name AS siteName,
+                gst.trained_on AS trainedOn,
+                gst.notes,
+                gst.created_at AS createdAt
+         FROM guard_site_training gst
+         JOIN users u ON u.id = gst.user_id
+         JOIN roles r ON r.id = u.role_id
+         LEFT JOIN guard_profiles gp ON gp.user_id = u.id
+         JOIN sites s ON s.id = gst.site_id
+         WHERE ${where.join(' AND ')}
+         ORDER BY s.name ASC, u.email ASC
+         LIMIT 2000`,
+        params
       );
       return ok(res, { items: rows });
     })
@@ -355,76 +393,174 @@ router.get(
 );
 
 router.post(
-  '/training/requirements',
+  '/training/assignments',
   ...withAuth(
     requireRoles('admin'),
-    validate(trainingRequirementBody),
+    validate(trainingAssignmentBody),
     asyncHandler(async (req, res) => {
       const b = req.validated.body;
       const pool = getPool();
-      const [r] = await pool.query(
-        `INSERT INTO training_requirements (name, description, role_slug, renewal_months, is_active)
-         VALUES (?, ?, ?, ?, ?)`,
-        [b.name, b.description ?? null, b.roleSlug ?? 'guard', b.renewalMonths ?? null, b.isActive === false ? 0 : 1]
-      );
+      await ensureGuardUser(pool, b.userId);
+      const [siteRows] = await pool.query(`SELECT id FROM sites WHERE id = ?`, [b.siteId]);
+      if (!siteRows.length) throw new AppError(404, 'NOT_FOUND', 'Site not found');
+      let r;
+      try {
+        [r] = await pool.query(
+          `INSERT INTO guard_site_training (user_id, site_id, trained_on, notes, created_by)
+           VALUES (?, ?, ?, ?, ?)`,
+          [b.userId, b.siteId, b.trainedOn ?? null, b.notes ?? null, req.auth.userId]
+        );
+      } catch (err) {
+        if (err?.code === 'ER_DUP_ENTRY') {
+          throw new AppError(409, 'CONFLICT', 'This guard is already trained for that site');
+        }
+        throw err;
+      }
+      await writeAudit({
+        userId: req.auth.userId,
+        action: 'training.assign',
+        entityType: 'guard_site_training',
+        entityId: r.insertId,
+        payload: b,
+        ip: req.ip,
+      });
       return ok(res, { id: r.insertId }, 201);
     })
   )
 );
 
 router.post(
-  '/training/requirements/:id/completions',
+  '/training/assignments/bulk',
   ...withAuth(
-    requireRoles('admin', 'supervisor'),
-    validate(trainingCompletionBody),
+    requireRoles('admin'),
+    validate(trainingBulkAssignmentBody),
     asyncHandler(async (req, res) => {
-      const requirementId = Number(req.params.id);
       const b = req.validated.body;
       const pool = getPool();
-      await pool.query(
-        `INSERT INTO training_completions
-          (requirement_id, user_id, completed_on, expires_on, evidence_media_id, created_by)
-         VALUES (?, ?, ?, ?, ?, ?)
-         ON DUPLICATE KEY UPDATE completed_on = VALUES(completed_on), expires_on = VALUES(expires_on),
-           evidence_media_id = VALUES(evidence_media_id), created_by = VALUES(created_by)`,
-        [requirementId, b.userId, b.completedOn, b.expiresOn ?? null, b.evidenceMediaId ?? null, req.auth.userId]
+      const uniqueUserIds = [...new Set(b.userIds)];
+      const uniqueSiteIds = [...new Set(b.siteIds)];
+
+      for (const userId of uniqueUserIds) {
+        await ensureGuardUser(pool, userId);
+      }
+
+      const [siteRows] = await pool.query(
+        `SELECT id FROM sites WHERE id IN (${uniqueSiteIds.map(() => '?').join(',')})`,
+        uniqueSiteIds
       );
-      await writeAudit({
-        userId: req.auth.userId,
-        action: 'training.completion.upsert',
-        entityType: 'training_requirement',
-        entityId: requirementId,
-        payload: b,
-        ip: req.ip,
-      });
-      return ok(res, { requirementId, userId: b.userId });
+      if (siteRows.length !== uniqueSiteIds.length) {
+        throw new AppError(404, 'NOT_FOUND', 'One or more sites were not found');
+      }
+
+      let created = 0;
+      let skipped = 0;
+      const createdIds = [];
+
+      for (const userId of uniqueUserIds) {
+        for (const siteId of uniqueSiteIds) {
+          try {
+            const [r] = await pool.query(
+              `INSERT INTO guard_site_training (user_id, site_id, trained_on, notes, created_by)
+               VALUES (?, ?, ?, ?, ?)`,
+              [userId, siteId, b.trainedOn ?? null, b.notes ?? null, req.auth.userId]
+            );
+            created += 1;
+            createdIds.push(r.insertId);
+          } catch (err) {
+            if (err?.code === 'ER_DUP_ENTRY') {
+              skipped += 1;
+              continue;
+            }
+            throw err;
+          }
+        }
+      }
+
+      if (created > 0) {
+        await writeAudit({
+          userId: req.auth.userId,
+          action: 'training.assign_bulk',
+          entityType: 'guard_site_training',
+          entityId: createdIds[0] ?? null,
+          payload: {
+            userIds: uniqueUserIds,
+            siteIds: uniqueSiteIds,
+            created,
+            skipped,
+            trainedOn: b.trainedOn,
+            notes: b.notes,
+          },
+          ip: req.ip,
+        });
+      }
+
+      return ok(res, { created, skipped, total: uniqueUserIds.length * uniqueSiteIds.length }, 201);
     })
   )
 );
 
-router.get(
-  '/training/compliance',
+router.patch(
+  '/training/assignments/:id',
   ...withAuth(
-    requireRoles('admin', 'supervisor'),
-    asyncHandler(async (_req, res) => {
+    requireRoles('admin'),
+    validate(
+      z.object({
+        trainedOn: trainingDateField,
+        notes: z.string().max(512).optional(),
+      }),
+      'body'
+    ),
+    asyncHandler(async (req, res) => {
+      const id = Number(req.params.id);
+      const b = req.validated.body;
       const pool = getPool();
-      const [rows] = await pool.query(
-        `SELECT u.id AS userId, u.email, tr.id AS requirementId, tr.name,
-                tc.completed_on AS completedOn, tc.expires_on AS expiresOn,
-                CASE
-                  WHEN tc.id IS NULL THEN 'missing'
-                  WHEN tc.expires_on IS NOT NULL AND tc.expires_on < CURDATE() THEN 'expired'
-                  WHEN tc.expires_on IS NOT NULL AND tc.expires_on <= DATE_ADD(CURDATE(), INTERVAL 30 DAY) THEN 'expiring'
-                  ELSE 'compliant'
-                END AS status
-         FROM users u
-         JOIN roles r ON r.id = u.role_id
-         JOIN training_requirements tr ON tr.role_slug = r.slug AND tr.is_active = 1
-         LEFT JOIN training_completions tc ON tc.requirement_id = tr.id AND tc.user_id = u.id
-         WHERE u.status = 'active'
-         ORDER BY u.email, tr.name`
+      const [existing] = await pool.query(
+        `SELECT id, user_id AS userId, site_id AS siteId FROM guard_site_training WHERE id = ?`,
+        [id]
       );
-      return ok(res, { items: rows });
+      if (!existing.length) throw new AppError(404, 'NOT_FOUND', 'Training assignment not found');
+      const row = existing[0];
+      await pool.query(
+        `UPDATE guard_site_training SET trained_on = ?, notes = COALESCE(?, notes) WHERE id = ?`,
+        [b.trainedOn ?? null, b.notes ?? null, id]
+      );
+      await writeAudit({
+        userId: req.auth.userId,
+        action: 'training.update',
+        entityType: 'guard_site_training',
+        entityId: id,
+        payload: { userId: row.userId, siteId: row.siteId, ...b },
+        ip: req.ip,
+      });
+      return ok(res, { id, updated: true });
+    })
+  )
+);
+
+router.delete(
+  '/training/assignments/:id',
+  ...withAuth(
+    requireRoles('admin'),
+    asyncHandler(async (req, res) => {
+      const id = Number(req.params.id);
+      const pool = getPool();
+      const [existing] = await pool.query(
+        `SELECT id, user_id AS userId, site_id AS siteId FROM guard_site_training WHERE id = ?`,
+        [id]
+      );
+      if (!existing.length) throw new AppError(404, 'NOT_FOUND', 'Training assignment not found');
+      const row = existing[0];
+      const [r] = await pool.query(`DELETE FROM guard_site_training WHERE id = ?`, [id]);
+      if (r.affectedRows === 0) throw new AppError(404, 'NOT_FOUND', 'Training assignment not found');
+      await writeAudit({
+        userId: req.auth.userId,
+        action: 'training.unassign',
+        entityType: 'guard_site_training',
+        entityId: id,
+        payload: { userId: row.userId, siteId: row.siteId },
+        ip: req.ip,
+      });
+      return ok(res, { deleted: true });
     })
   )
 );
@@ -875,127 +1011,6 @@ router.post(
       });
       return ok(res, { id, sent: true });
     })
-  )
-);
-
-router.get(
-  '/certifications',
-  ...withAuth(
-    requireRoles('admin', 'supervisor'),
-  asyncHandler(async (req, res) => {
-    const pool = getPool();
-    const where = [];
-    const params = [];
-    if (req.query.userId) {
-      where.push('user_id = ?');
-      params.push(Number(req.query.userId));
-    }
-    if (req.query.expiringBefore) {
-      where.push('expires_on IS NOT NULL AND expires_on <= ?');
-      params.push(req.query.expiringBefore);
-    }
-    const sqlWhere = where.length ? `WHERE ${where.join(' AND ')}` : '';
-    const [rows] = await pool.query(
-      `SELECT id, user_id AS userId, name, issuer, obtained_on AS obtainedOn, expires_on AS expiresOn
-       FROM employee_certifications ${sqlWhere} ORDER BY id DESC LIMIT 500`,
-      params
-    );
-    return ok(res, { items: rows });
-  })
-  )
-);
-
-router.post(
-  '/certifications',
-  ...withAuth(
-    requireRoles('admin'),
-  validate(certBody),
-  asyncHandler(async (req, res) => {
-    const b = req.validated.body;
-    const pool = getPool();
-    const [r] = await pool.query(
-      `INSERT INTO employee_certifications (user_id, name, issuer, obtained_on, expires_on)
-       VALUES (?, ?, ?, ?, ?)`,
-      [b.userId, b.name, b.issuer ?? null, b.obtainedOn ?? null, b.expiresOn ?? null]
-    );
-    await writeAudit({
-      userId: req.auth.userId,
-      action: 'certification.create',
-      entityType: 'employee_certification',
-      entityId: r.insertId,
-      payload: { userId: b.userId, name: b.name },
-      ip: req.ip,
-    });
-    return ok(res, { id: r.insertId }, 201);
-  })
-  )
-);
-
-router.patch(
-  '/certifications/:id',
-  ...withAuth(
-    requireRoles('admin'),
-  validate(certPatch),
-  asyncHandler(async (req, res) => {
-    const id = Number(req.params.id);
-    const b = req.validated.body;
-    const pool = getPool();
-    const fields = [];
-    const params = [];
-    if (b.name !== undefined) {
-      fields.push('name = ?');
-      params.push(b.name);
-    }
-    if (b.issuer !== undefined) {
-      fields.push('issuer = ?');
-      params.push(b.issuer);
-    }
-    if (b.obtainedOn !== undefined) {
-      fields.push('obtained_on = ?');
-      params.push(b.obtainedOn);
-    }
-    if (b.expiresOn !== undefined) {
-      fields.push('expires_on = ?');
-      params.push(b.expiresOn);
-    }
-    if (!fields.length) throw new AppError(400, 'VALIDATION_ERROR', 'No updates');
-    params.push(id);
-    const [r] = await pool.query(
-      `UPDATE employee_certifications SET ${fields.join(', ')} WHERE id = ?`,
-      params
-    );
-    if (r.affectedRows === 0) throw new AppError(404, 'NOT_FOUND', 'Not found');
-    await writeAudit({
-      userId: req.auth.userId,
-      action: 'certification.update',
-      entityType: 'employee_certification',
-      entityId: id,
-      payload: b,
-      ip: req.ip,
-    });
-    return ok(res, { updated: true });
-  })
-  )
-);
-
-router.delete(
-  '/certifications/:id',
-  ...withAuth(
-    requireRoles('admin'),
-  asyncHandler(async (req, res) => {
-    const id = Number(req.params.id);
-    const pool = getPool();
-    const [r] = await pool.query(`DELETE FROM employee_certifications WHERE id = ?`, [id]);
-    if (r.affectedRows === 0) throw new AppError(404, 'NOT_FOUND', 'Not found');
-    await writeAudit({
-      userId: req.auth.userId,
-      action: 'certification.delete',
-      entityType: 'employee_certification',
-      entityId: id,
-      ip: req.ip,
-    });
-    return ok(res, { deleted: true });
-  })
   )
 );
 

@@ -143,32 +143,6 @@ CREATE TABLE IF NOT EXISTS employee_lifecycle_events (
     ON DELETE CASCADE ON UPDATE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-CREATE TABLE IF NOT EXISTS training_requirements (
-  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-  name VARCHAR(128) NOT NULL,
-  description VARCHAR(1024) NULL,
-  role_slug VARCHAR(32) NOT NULL DEFAULT 'guard',
-  renewal_months INT UNSIGNED NULL,
-  is_active TINYINT(1) NOT NULL DEFAULT 1,
-  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
-CREATE TABLE IF NOT EXISTS training_completions (
-  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-  requirement_id BIGINT UNSIGNED NOT NULL,
-  user_id INT UNSIGNED NOT NULL,
-  completed_on DATE NOT NULL,
-  expires_on DATE NULL,
-  evidence_media_id BIGINT UNSIGNED NULL,
-  created_by INT UNSIGNED NULL,
-  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  UNIQUE KEY uk_training_user_req (requirement_id, user_id),
-  CONSTRAINT fk_training_req FOREIGN KEY (requirement_id) REFERENCES training_requirements (id)
-    ON DELETE CASCADE ON UPDATE CASCADE,
-  CONSTRAINT fk_training_user FOREIGN KEY (user_id) REFERENCES users (id)
-    ON DELETE CASCADE ON UPDATE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
 CREATE TABLE IF NOT EXISTS payroll_rules (
   id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
   name VARCHAR(128) NOT NULL,
