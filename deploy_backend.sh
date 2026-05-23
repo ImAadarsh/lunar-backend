@@ -45,7 +45,24 @@ grep -q 'lunar-web.endeavourdigital.cloud' '${app_dir}/.env' 2>/dev/null || \
 remote_post_deploy_checks() {
   remote "set -e
 cd '${app_dir}'
-curl -fsS --connect-timeout 10 'http://127.0.0.1:${api_port}/health' | grep -q '\"status\":\"ok\"' || { echo 'GET /health failed'; exit 1; }
+
+wait_for_health() {
+  local i=1
+  while [ \"\$i\" -le 30 ]; do
+    if curl -fsS --connect-timeout 2 'http://127.0.0.1:${api_port}/health' 2>/dev/null | grep -q '\"status\":\"ok\"'; then
+      return 0
+    fi
+    sleep 1
+    i=\$((i + 1))
+  done
+  echo 'GET /health failed after 30s — recent PM2 logs:' >&2
+  pm2 logs '${process_name}' --lines 40 --nostream 2>/dev/null || true
+  pm2 describe '${process_name}' 2>/dev/null || true
+  return 1
+}
+
+wait_for_health
+
 curl -fsS --connect-timeout 10 'http://127.0.0.1:${api_port}/ready' | grep -q '\"status\":\"ready\"' || { echo 'GET /ready failed'; exit 1; }
 code=\$(curl -sS -o /tmp/api_login.json -w '%{http_code}' --connect-timeout 15 -X POST 'http://127.0.0.1:${api_port}/api/v1/auth/login' -H 'Content-Type: application/json' -d '{\"email\":\"deploy-probe@invalid.local\",\"password\":\"invalid\"}')
 test \"\$code\" = '401' || { echo \"POST /api/v1/auth/login expected 401, got \$code: \$(cat /tmp/api_login.json)\"; exit 1; }
@@ -83,6 +100,13 @@ npm run db:migrate
 
 mkdir -p uploads exports
 
+# CORS for portal before (re)start so one restart picks up .env
+if grep -q 'lunar-web.endeavourdigital.cloud' .env 2>/dev/null; then
+  :
+else
+  sed -i 's|^CORS_ORIGINS=\(.*\)|CORS_ORIGINS=\1,https://lunar-web.endeavourdigital.cloud|' .env 2>/dev/null || true
+fi
+
 if pm2 describe "$PROCESS_NAME" >/dev/null 2>&1; then
   pm2 restart "$PROCESS_NAME" --update-env
 else
@@ -97,8 +121,6 @@ fi
 
 pm2 save
 REMOTE_GIT
-  ensure_portal_cors
-  remote "pm2 restart '$process_name' '$worker_name' --update-env 2>/dev/null || true"
   remote_post_deploy_checks
   log "Backend deploy complete. API: https://lunar.endeavourdigital.cloud/api/v1"
 }
@@ -120,11 +142,10 @@ deploy_rsync() {
     -e "ssh ${ssh_opts[*]}" \
     ./ "${ssh_target}:${app_dir}/"
   remote "cd '${app_dir}' && npm ci --omit=dev && npm run build --if-present && npm run db:migrate && mkdir -p uploads exports"
+  ensure_portal_cors
   remote "if pm2 describe '${process_name}' >/dev/null 2>&1; then pm2 restart '${process_name}' --update-env; else pm2 start src/server.js --name '${process_name}' --time; fi"
   remote "if pm2 describe '${worker_name}' >/dev/null 2>&1; then pm2 restart '${worker_name}' --update-env; else pm2 start src/workers/jobWorker.js --name '${worker_name}' --time; fi"
   remote "pm2 save"
-  ensure_portal_cors
-  remote "pm2 restart '$process_name' '$worker_name' --update-env 2>/dev/null || true"
   remote_post_deploy_checks
   log "Backend rsync deploy complete."
 }

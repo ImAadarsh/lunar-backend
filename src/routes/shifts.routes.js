@@ -11,12 +11,17 @@ import { writeAudit } from '../utils/audit.js';
 import { createNotification } from '../services/notificationService.js';
 import { publishCommandEvent } from '../services/commandEventService.js';
 import {
-  canAssignFromAvailability,
+  assertCanAssignShift,
   enrichShiftsWithDutyState,
   ensureGuardTrainedForSite,
-  evaluateGuardDutyForUser,
   autoMarkMissedShifts,
 } from '../services/guardDutyService.js';
+import {
+  normalizeShiftDateTimeForQuery,
+  normalizeShiftDateTimeForStorage,
+  normalizeShiftRowsForApi,
+  serializeShiftDateTime,
+} from '../utils/ukDateTime.js';
 
 const router = Router();
 const templates = Router();
@@ -38,6 +43,23 @@ const shiftBody = z.object({
   startsAt: z.string().min(1),
   endsAt: z.string().min(1),
   status: z.enum(['scheduled', 'active', 'completed', 'cancelled', 'missed']).optional(),
+  force: z.boolean().optional(),
+});
+
+const bulkScheduleBody = z.object({
+  userId: z.number().int(),
+  siteId: z.number().int(),
+  force: z.boolean().optional(),
+  shifts: z
+    .array(
+      z.object({
+        startsAt: z.string().min(1),
+        endsAt: z.string().min(1),
+        siteId: z.number().int().optional(),
+      })
+    )
+    .min(1)
+    .max(14),
 });
 
 const shiftPatch = z
@@ -47,6 +69,7 @@ const shiftPatch = z
     status: z.enum(['scheduled', 'active', 'completed', 'cancelled', 'missed']).optional(),
     siteId: z.number().int().optional(),
     userId: z.number().int().optional(),
+    force: z.boolean().optional(),
   })
   .refine((o) => Object.keys(o).length > 0, { message: 'No fields' });
 
@@ -202,11 +225,11 @@ router.get(
     }
     if (q.from) {
       where.push('s.ends_at >= ?');
-      params.push(q.from);
+      params.push(normalizeShiftDateTimeForQuery(q.from));
     }
     if (q.to) {
       where.push('s.starts_at <= ?');
-      params.push(q.to);
+      params.push(normalizeShiftDateTimeForQuery(q.to));
     }
     const sqlWhere = where.length ? `WHERE ${where.join(' AND ')}` : '';
     await autoMarkMissedShifts(pool, {
@@ -224,7 +247,7 @@ router.get(
        ${sqlWhere} ORDER BY s.starts_at DESC LIMIT 500`,
       params
     );
-    const items = await enrichShiftsWithDutyState(pool, rows);
+    const items = normalizeShiftRowsForApi(await enrichShiftsWithDutyState(pool, rows));
     return ok(res, { items });
   })
   )
@@ -238,15 +261,14 @@ router.post(
   asyncHandler(async (req, res) => {
     const b = req.validated.body;
     const pool = getPool();
-    await ensureGuardTrainedForSite(pool, b.userId, b.siteId);
-    const duty = await evaluateGuardDutyForUser(pool, b.userId);
-    if (!canAssignFromAvailability(duty)) {
-      throw new AppError(
-        400,
-        'VALIDATION_ERROR',
-        `Guard cannot be assigned (${duty.state.replace(/_/g, ' ')})`
-      );
-    }
+    await assertCanAssignShift(pool, {
+      userId: b.userId,
+      siteId: b.siteId,
+      startsAt: b.startsAt,
+      endsAt: b.endsAt,
+      force: Boolean(b.force),
+      actorRole: req.auth.role,
+    });
     const [r] = await pool.query(
       `INSERT INTO shifts (site_id, user_id, template_id, starts_at, ends_at, status)
        VALUES (?, ?, ?, ?, ?, ?)`,
@@ -254,17 +276,19 @@ router.post(
         b.siteId,
         b.userId,
         b.templateId ?? null,
-        b.startsAt.slice(0, 19).replace('T', ' '),
-        b.endsAt.slice(0, 19).replace('T', ' '),
+        normalizeShiftDateTimeForStorage(b.startsAt),
+        normalizeShiftDateTimeForStorage(b.endsAt),
         b.status ?? 'scheduled',
       ]
     );
+    const startsAtIso = serializeShiftDateTime(b.startsAt);
+    const endsAtIso = serializeShiftDateTime(b.endsAt);
     await writeAudit({
       userId: req.auth.userId,
       action: 'shift.create',
       entityType: 'shift',
       entityId: r.insertId,
-      payload: { siteId: b.siteId, userId: b.userId, startsAt: b.startsAt, endsAt: b.endsAt },
+      payload: { siteId: b.siteId, userId: b.userId, startsAt: startsAtIso, endsAt: endsAtIso },
       ip: req.ip,
     });
     await publishCommandEvent({
@@ -274,17 +298,101 @@ router.post(
       siteId: b.siteId,
       entityType: 'shift',
       entityId: r.insertId,
-      payload: { startsAt: b.startsAt, endsAt: b.endsAt, status: b.status ?? 'scheduled' },
+      payload: { startsAt: startsAtIso, endsAt: endsAtIso, status: b.status ?? 'scheduled' },
     });
     await createNotification({
       userId: b.userId,
       type: 'shift.assigned',
       title: 'New shift assigned',
-      body: `Shift #${r.insertId} starts at ${b.startsAt}`,
-      payload: { shiftId: Number(r.insertId), siteId: b.siteId, startsAt: b.startsAt, endsAt: b.endsAt },
+      body: `Shift #${r.insertId} starts at ${startsAtIso}`,
+      payload: { shiftId: Number(r.insertId), siteId: b.siteId, startsAt: startsAtIso, endsAt: endsAtIso },
     });
     return ok(res, { id: r.insertId }, 201);
   })
+  )
+);
+
+router.post(
+  '/shifts/bulk-schedule',
+  ...withAuth(
+    requireRoles('admin', 'supervisor'),
+    validate(bulkScheduleBody),
+    asyncHandler(async (req, res) => {
+      const b = req.validated.body;
+      const pool = getPool();
+      const force = Boolean(b.force);
+      const sorted = [...b.shifts].sort(
+        (a, c) => new Date(a.startsAt).getTime() - new Date(c.startsAt).getTime()
+      );
+      const validated = [];
+      const pendingShifts = [];
+
+      for (let i = 0; i < sorted.length; i += 1) {
+        const row = sorted[i];
+        const siteId = row.siteId ?? b.siteId;
+        try {
+          const meta = await assertCanAssignShift(pool, {
+            userId: b.userId,
+            siteId,
+            startsAt: row.startsAt,
+            endsAt: row.endsAt,
+            force,
+            actorRole: req.auth.role,
+            pendingShifts,
+          });
+          pendingShifts.push({ startsAt: row.startsAt, endsAt: row.endsAt });
+          validated.push({ row, siteId, meta });
+        } catch (err) {
+          throw new AppError(
+            400,
+            'VALIDATION_ERROR',
+            `Shift ${i + 1}: ${err.message ?? 'Invalid assignment'}`
+          );
+        }
+      }
+
+      const created = [];
+      for (const { row, siteId } of validated) {
+        const [r] = await pool.query(
+          `INSERT INTO shifts (site_id, user_id, template_id, starts_at, ends_at, status)
+           VALUES (?, ?, NULL, ?, ?, 'scheduled')`,
+          [
+            siteId,
+            b.userId,
+            normalizeShiftDateTimeForStorage(row.startsAt),
+            normalizeShiftDateTimeForStorage(row.endsAt),
+          ]
+        );
+        created.push(Number(r.insertId));
+      }
+
+      await writeAudit({
+        userId: req.auth.userId,
+        action: 'shift.bulk_schedule',
+        entityType: 'shift',
+        entityId: created[0] ?? null,
+        payload: {
+          userId: b.userId,
+          siteId: b.siteId,
+          shiftIds: created,
+          count: created.length,
+          force,
+        },
+        ip: req.ip,
+      });
+
+      if (created.length) {
+        await createNotification({
+          userId: b.userId,
+          type: 'shift.assigned',
+          title: 'Schedule updated',
+          body: `${created.length} shift${created.length === 1 ? '' : 's'} added to your roster`,
+          payload: { shiftIds: created, siteId: b.siteId, count: created.length },
+        });
+      }
+
+      return ok(res, { ids: created, count: created.length }, 201);
+    })
   )
 );
 
@@ -301,11 +409,11 @@ router.patch(
     const params = [];
     if (b.startsAt !== undefined) {
       fields.push('starts_at = ?');
-      params.push(b.startsAt.slice(0, 19).replace('T', ' '));
+      params.push(normalizeShiftDateTimeForStorage(b.startsAt));
     }
     if (b.endsAt !== undefined) {
       fields.push('ends_at = ?');
-      params.push(b.endsAt.slice(0, 19).replace('T', ' '));
+      params.push(normalizeShiftDateTimeForStorage(b.endsAt));
     }
     if (b.status !== undefined) {
       fields.push('status = ?');
@@ -320,23 +428,33 @@ router.patch(
       params.push(b.userId);
     }
     const [existingRows] = await pool.query(
-      `SELECT user_id AS userId, site_id AS siteId FROM shifts WHERE id = ?`,
+      `SELECT user_id AS userId, site_id AS siteId, starts_at AS startsAt, ends_at AS endsAt
+       FROM shifts WHERE id = ?`,
       [id]
     );
     const existing = existingRows[0];
     if (!existing) throw new AppError(404, 'NOT_FOUND', 'Shift not found');
     const nextUserId = b.userId ?? existing.userId;
     const nextSiteId = b.siteId ?? existing.siteId;
-    await ensureGuardTrainedForSite(pool, nextUserId, nextSiteId);
-    if (b.userId !== undefined && Number(b.userId) !== Number(existing.userId)) {
-      const duty = await evaluateGuardDutyForUser(pool, nextUserId);
-      if (!canAssignFromAvailability(duty)) {
-        throw new AppError(
-          400,
-          'VALIDATION_ERROR',
-          `Guard cannot be assigned (${duty.state.replace(/_/g, ' ')})`
-        );
-      }
+    const nextStartsAt = b.startsAt ?? existing.startsAt;
+    const nextEndsAt = b.endsAt ?? existing.endsAt;
+    const scheduleChanged =
+      b.userId !== undefined ||
+      b.startsAt !== undefined ||
+      b.endsAt !== undefined ||
+      b.siteId !== undefined;
+    if (scheduleChanged && nextStartsAt && nextEndsAt) {
+      await assertCanAssignShift(pool, {
+        userId: nextUserId,
+        siteId: nextSiteId,
+        startsAt: nextStartsAt,
+        endsAt: nextEndsAt,
+        excludeShiftId: id,
+        force: Boolean(b.force),
+        actorRole: req.auth.role,
+      });
+    } else {
+      await ensureGuardTrainedForSite(pool, nextUserId, nextSiteId);
     }
     params.push(id);
     const [r] = await pool.query(`UPDATE shifts SET ${fields.join(', ')} WHERE id = ?`, params);
@@ -456,6 +574,38 @@ swaps.post(
     });
     return ok(res, { id: r.insertId }, 201);
   })
+  )
+);
+
+swaps.get(
+  '/mine',
+  ...withAuth(
+    requireRoles('guard'),
+    asyncHandler(async (req, res) => {
+      const pool = getPool();
+      const [rows] = await pool.query(
+        `SELECT sw.id, sw.shift_id AS shiftId, sw.requested_by AS requestedBy,
+                sw.target_user_id AS targetUserId, target.email AS targetEmail,
+                sw.status, sw.created_at AS createdAt, sw.resolved_at AS resolvedAt,
+                s.site_id AS siteId, st.name AS siteName,
+                s.starts_at AS startsAt, s.ends_at AS endsAt
+         FROM shift_swaps sw
+         JOIN shifts s ON s.id = sw.shift_id
+         JOIN sites st ON st.id = s.site_id
+         LEFT JOIN users target ON target.id = sw.target_user_id
+         WHERE sw.requested_by = ?
+         ORDER BY sw.id DESC
+         LIMIT 50`,
+        [req.auth.userId]
+      );
+      return ok(res, {
+        items: rows.map((row) => ({
+          ...row,
+          startsAt: serializeShiftDateTime(row.startsAt),
+          endsAt: serializeShiftDateTime(row.endsAt),
+        })),
+      });
+    })
   )
 );
 

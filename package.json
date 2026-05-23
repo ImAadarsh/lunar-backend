@@ -13,7 +13,8 @@
     "test:watch": "vitest",
     "seed:demo": "node scripts/seedDemoUsers.js",
     "seed:guards": "node scripts/importGuardsFromExcel.js",
-    "seed:sites": "node scripts/resetSites.js"
+    "seed:sites": "node scripts/resetSites.js",
+    "reset:guard-passwords": "node scripts/resetGuardPasswords.js"
   },
   "engines": {
     "node": ">=18"

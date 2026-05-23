@@ -16,6 +16,8 @@ export function getPool() {
       connectionLimit: 10,
       queueLimit: 0,
       enableKeepAlive: true,
+      /** Return DATETIME as strings so UK wall-clock values are not shifted by server TZ. */
+      dateStrings: true,
       ssl: env.db.ssl ? { rejectUnauthorized: true } : undefined,
     });
   }

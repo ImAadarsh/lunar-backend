@@ -1,7 +1,10 @@
 import { AppError } from '../utils/httpError.js';
+import { normalizeShiftRowForApi } from '../utils/ukDateTime.js';
 
 export const GUARD_RECHARGE_HOURS = 7;
 export const MISSED_DUTY_THRESHOLD = 0.5;
+export const DUTY_TIMEZONE = 'Europe/London';
+export const GUARD_RECHARGE_MS = GUARD_RECHARGE_HOURS * 60 * 60 * 1000;
 
 /** Display / availability states returned to clients */
 export const DUTY_DISPLAY_STATES = [
@@ -100,6 +103,208 @@ function shiftTimes(shift) {
     startMs: new Date(shift.startsAt).getTime(),
     endMs: new Date(shift.endsAt).getTime(),
   };
+}
+
+/** Calendar duty day from shift start (UK), e.g. 21:00–06:00 uses the evening’s date. */
+export function getDutyDate(startsAt) {
+  const d = new Date(startsAt);
+  if (Number.isNaN(d.getTime())) return null;
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: DUTY_TIMEZONE,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(d);
+  const y = parts.find((p) => p.type === 'year')?.value;
+  const m = parts.find((p) => p.type === 'month')?.value;
+  const day = parts.find((p) => p.type === 'day')?.value;
+  if (!y || !m || !day) return null;
+  return `${y}-${m}-${day}`;
+}
+
+export function formatDutyDateLabel(dutyDate) {
+  if (!dutyDate) return '';
+  return new Date(`${dutyDate}T12:00:00`).toLocaleDateString('en-GB', {
+    weekday: 'short',
+    day: 'numeric',
+    month: 'short',
+    year: 'numeric',
+  });
+}
+
+/** Shifts whose duty day (from starts_at) matches dutyDate. */
+export async function findShiftsOnDutyDate(pool, userId, dutyDate, { excludeShiftId } = {}) {
+  if (!dutyDate) return [];
+  const [rows] = await pool.query(
+    `SELECT id, starts_at AS startsAt, ends_at AS endsAt, status
+     FROM shifts
+     WHERE user_id = ?
+       AND status <> 'cancelled'
+       AND starts_at >= DATE_SUB(?, INTERVAL 1 DAY)
+       AND starts_at < DATE_ADD(?, INTERVAL 2 DAY)`,
+    [userId, `${dutyDate} 00:00:00`, `${dutyDate} 00:00:00`]
+  );
+  return rows.filter((s) => {
+    if (excludeShiftId != null && Number(s.id) === Number(excludeShiftId)) return false;
+    return getDutyDate(s.startsAt) === dutyDate;
+  });
+}
+
+/** Last completed/active duty end strictly before proposedStartMs (missed excluded). */
+export async function fetchLastDutyEndedBefore(pool, userId, beforeMs) {
+  const before = new Date(beforeMs).toISOString().slice(0, 19).replace('T', ' ');
+  const [rows] = await pool.query(
+    `SELECT MAX(COALESCE(a.check_out_at, s.ends_at)) AS lastEndedAt
+     FROM shifts s
+     LEFT JOIN attendance_sessions a
+       ON a.shift_id = s.id AND a.user_id = s.user_id AND a.check_out_at IS NOT NULL
+     WHERE s.user_id = ?
+       AND s.status IN ('completed', 'active')
+       AND s.status <> 'missed'
+       AND s.status <> 'cancelled'
+       AND COALESCE(a.check_out_at, s.ends_at) < ?`,
+    [userId, before]
+  );
+  return rows[0]?.lastEndedAt ?? null;
+}
+
+export async function findOverlappingShifts(pool, userId, startMs, endMs, { excludeShiftId } = {}) {
+  const start = new Date(startMs).toISOString().slice(0, 19).replace('T', ' ');
+  const end = new Date(endMs).toISOString().slice(0, 19).replace('T', ' ');
+  const [rows] = await pool.query(
+    `SELECT id, starts_at AS startsAt, ends_at AS endsAt
+     FROM shifts
+     WHERE user_id = ?
+       AND status IN ('scheduled', 'active', 'missed')
+       AND starts_at < ?
+       AND ends_at > ?
+     ${excludeShiftId != null ? 'AND id <> ?' : ''}
+     LIMIT 5`,
+    excludeShiftId != null
+      ? [userId, end, start, excludeShiftId]
+      : [userId, end, start]
+  );
+  return rows;
+}
+
+/**
+ * One duty per duty-day (date of shift start), 7h recharge before next start, optional admin force.
+ */
+function pendingConflictsWithShift(pendingShifts, { startMs, endMs, dutyDate, excludeShiftId }) {
+  for (const p of pendingShifts) {
+    if (excludeShiftId != null && Number(p.id) === Number(excludeShiftId)) continue;
+    const pStart = new Date(p.startsAt).getTime();
+    const pEnd = new Date(p.endsAt).getTime();
+    if (getDutyDate(p.startsAt) === dutyDate) return 'duty_day';
+    if (pStart < endMs && pEnd > startMs) return 'overlap';
+  }
+  return null;
+}
+
+export async function assertCanAssignShift(pool, {
+  userId,
+  siteId,
+  startsAt,
+  endsAt,
+  excludeShiftId = null,
+  force = false,
+  actorRole = null,
+  pendingShifts = [],
+}) {
+  const startMs = new Date(startsAt).getTime();
+  const endMs = new Date(endsAt).getTime();
+  if (Number.isNaN(startMs) || Number.isNaN(endMs)) {
+    throw new AppError(400, 'VALIDATION_ERROR', 'Invalid shift start or end time');
+  }
+  if (endMs <= startMs) {
+    throw new AppError(400, 'VALIDATION_ERROR', 'Shift end must be after start');
+  }
+
+  await ensureGuardTrainedForSite(pool, userId, siteId);
+
+  const dutyDate = getDutyDate(startsAt);
+  if (!dutyDate) {
+    throw new AppError(400, 'VALIDATION_ERROR', 'Could not determine duty date from start time');
+  }
+
+  if (force) {
+    if (actorRole !== 'admin') {
+      throw new AppError(403, 'FORBIDDEN', 'Only admins can force-assign guard duty');
+    }
+    return { dutyDate, forced: true };
+  }
+
+  const pendingDuty = pendingConflictsWithShift(pendingShifts, {
+    startMs,
+    endMs,
+    dutyDate,
+    excludeShiftId,
+  });
+  if (pendingDuty === 'duty_day') {
+    throw new AppError(
+      400,
+      'VALIDATION_ERROR',
+      `Guard already has duty on ${formatDutyDateLabel(dutyDate)} in this schedule batch`
+    );
+  }
+  if (pendingDuty === 'overlap') {
+    throw new AppError(409, 'CONFLICT', 'Shift times overlap another shift in this schedule batch');
+  }
+
+  const sameDay = await findShiftsOnDutyDate(pool, userId, dutyDate, { excludeShiftId });
+  if (sameDay.length) {
+    throw new AppError(
+      400,
+      'VALIDATION_ERROR',
+      `Guard already has duty on ${formatDutyDateLabel(dutyDate)} (one duty per day)`
+    );
+  }
+
+  const overlaps = await findOverlappingShifts(pool, userId, startMs, endMs, { excludeShiftId });
+  if (overlaps.length) {
+    throw new AppError(409, 'CONFLICT', 'Shift times overlap an existing assignment');
+  }
+
+  let lastEndedAt = await fetchLastDutyEndedBefore(pool, userId, startMs);
+  for (const p of [...pendingShifts].sort(
+    (a, b) => new Date(b.endsAt).getTime() - new Date(a.endsAt).getTime()
+  )) {
+    const pEnd = new Date(p.endsAt).getTime();
+    if (pEnd < startMs) {
+      lastEndedAt = p.endsAt;
+      break;
+    }
+  }
+  if (lastEndedAt) {
+    const endedMs = new Date(lastEndedAt).getTime();
+    const earliestMs = endedMs + GUARD_RECHARGE_MS;
+    if (startMs < earliestMs) {
+      const earliest = new Date(earliestMs).toLocaleString('en-GB', {
+        timeZone: DUTY_TIMEZONE,
+        dateStyle: 'medium',
+        timeStyle: 'short',
+      });
+      throw new AppError(
+        400,
+        'VALIDATION_ERROR',
+        `Guard must finish ${GUARD_RECHARGE_HOURS}h recharge before this duty (earliest start ${earliest})`
+      );
+    }
+  }
+
+  const duty = await evaluateGuardDutyForUser(pool, userId);
+  if (['on_duty', 'duty_not_started'].includes(duty.state) && duty.currentShift) {
+    const currentDutyDate = getDutyDate(duty.currentShift.startsAt);
+    if (currentDutyDate === dutyDate) {
+      throw new AppError(
+        400,
+        'VALIDATION_ERROR',
+        'Guard is already on or scheduled for duty this duty day'
+      );
+    }
+  }
+
+  return { dutyDate, forced: false };
 }
 
 /**
@@ -297,7 +502,7 @@ export function evaluateGuardDutySnapshot({
       return {
         state: 'assigned',
         dutyState,
-        canAssign: false,
+        canAssign: true,
         rechargingUntil: null,
         lastShiftEndedAt: lastDutyEndedAt ?? null,
         currentShift: primaryShift,
@@ -407,13 +612,15 @@ export async function enrichShiftsWithDutyState(pool, shifts) {
   await autoMarkMissedShifts(pool);
   const shiftIds = shifts.map((s) => Number(s.id));
   const checkedInShiftIds = await fetchOpenAttendanceByShift(pool, shiftIds);
-  return shifts.map((shift) => ({
-    ...shift,
-    dutyState: computeShiftDutyState({
-      shift,
-      hasCheckedIn: checkedInShiftIds.has(Number(shift.id)),
-    }),
-  }));
+  return shifts.map((shift) =>
+    normalizeShiftRowForApi({
+      ...shift,
+      dutyState: computeShiftDutyState({
+        shift,
+        hasCheckedIn: checkedInShiftIds.has(Number(shift.id)),
+      }),
+    })
+  );
 }
 
 /** @deprecated Use evaluateGuardDutyForUser — kept for gradual migration */
