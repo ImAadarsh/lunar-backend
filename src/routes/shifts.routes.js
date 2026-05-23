@@ -578,6 +578,53 @@ swaps.post(
 );
 
 swaps.get(
+  '/candidates',
+  ...withAuth(
+    requireRoles('guard'),
+    asyncHandler(async (req, res) => {
+      const shiftId = Number(req.query.shiftId);
+      if (!Number.isInteger(shiftId) || shiftId <= 0) {
+        throw new AppError(400, 'VALIDATION_ERROR', 'shiftId query required');
+      }
+      const pool = getPool();
+      const [shiftRows] = await pool.query(
+        `SELECT id, user_id AS userId, site_id AS siteId, starts_at AS startsAt, ends_at AS endsAt
+         FROM shifts WHERE id = ?`,
+        [shiftId]
+      );
+      const shift = shiftRows[0];
+      if (!shift) throw new AppError(404, 'NOT_FOUND', 'Shift not found');
+      if (Number(shift.userId) !== req.auth.userId) {
+        throw new AppError(403, 'FORBIDDEN', 'You can only request swaps for your own shifts');
+      }
+
+      const [rows] = await pool.query(
+        `SELECT u.id AS userId, u.email, gp.full_name AS guardName
+         FROM guard_site_training gst
+         JOIN users u ON u.id = gst.user_id
+         JOIN roles r ON r.id = u.role_id
+         LEFT JOIN guard_profiles gp ON gp.user_id = u.id
+         WHERE gst.site_id = ?
+           AND u.id <> ?
+           AND u.status = 'active'
+           AND r.slug = 'guard'
+           AND NOT EXISTS (
+             SELECT 1 FROM shifts s
+             WHERE s.user_id = u.id
+               AND s.id <> ?
+               AND s.status IN ('scheduled', 'active')
+               AND s.starts_at < ?
+               AND s.ends_at > ?
+           )
+         ORDER BY gp.full_name ASC, u.email ASC`,
+        [shift.siteId, req.auth.userId, shiftId, shift.endsAt, shift.startsAt]
+      );
+      return ok(res, { items: rows });
+    })
+  )
+);
+
+swaps.get(
   '/mine',
   ...withAuth(
     requireRoles('guard'),
